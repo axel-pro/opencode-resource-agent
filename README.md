@@ -26,7 +26,7 @@ Add it to the `package.json` of the asking project and run `npm install`:
 ```json
 {
   "devDependencies": {
-    "opencode-resource-agent": "github:axel-pro/opencode-resource-agent#v0.1.0"
+    "opencode-resource-agent": "github:axel-pro/opencode-resource-agent#v0.1.2"
   }
 }
 ```
