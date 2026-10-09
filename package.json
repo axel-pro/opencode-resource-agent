@@ -1,6 +1,6 @@
 {
   "name": "opencode-resource-agent",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "OpenCode plugin and CLI for asking the agents of other repositories: questions and edits over ACP via acpx",
   "keywords": [
     "opencode",
