@@ -49,8 +49,8 @@ npx resource-agent status   # every item should have a check mark
 Requirements: Node.js 22.13+ in `PATH` and OpenCode 1.x (both for the asking project and for the resource agents).
 Linux and macOS are supported; Windows has not been tested.
 
-To update, change the tag and run `npm install` again, then restart OpenCode. Releases are listed on the
-[Releases](https://github.com/axel-pro/opencode-resource-agent/releases) page.
+To update, change the tag and run `npm install` again, then restart OpenCode. Versions are listed on the
+[Tags](https://github.com/axel-pro/opencode-resource-agent/tags) page.
 
 ## Config
 
@@ -231,8 +231,8 @@ npm version patch   # or minor / major: updates package.json and creates the vX.
 git push --follow-tags
 ```
 
-On the tag, GitHub Actions (`.github/workflows/release.yml`) runs the tests, checks that the tag matches
-the version in `package.json`, and creates a GitHub Release with notes generated from the commits.
+GitHub Actions (`.github/workflows/ci.yml`) runs the tests on Node.js 22 and 24 on every push to `main`
+and on pull requests. There is no release workflow: the tag itself is the release.
 
 ## License
 
