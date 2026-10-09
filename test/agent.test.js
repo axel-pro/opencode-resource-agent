@@ -144,7 +144,8 @@ test("the project is the nearest folder above with a resources config", (t) => {
   const profile = project.run(["profile", "backend"], { cwd: sub });
   assert.match(profile.stdout, new RegExp(`Folder: ${project.back}\\n`));
   // conversation state is in the project root too
-  assert.equal(project.run(["backend", "question"], { cwd: sub, env: { RESOURCE_AGENT_CHAT: "chat1" } }).code, 0);
+  const asked = project.run(["backend", "question"], { cwd: sub, env: { RESOURCE_AGENT_CHAT: "chat1" } });
+  assert.equal(asked.code, 0, asked.stderr);
   assert.ok(fs.existsSync(path.join(project.project, ".opencode", ".state", "resource-agent_backend_chat1")));
   assert.ok(!fs.existsSync(path.join(sub, ".opencode")));
 

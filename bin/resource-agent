@@ -637,10 +637,14 @@ function readJob(conversation) {
     return undefined;
   }
   const meta = readJsonFile(path.join(dir, "meta.json"));
-  const result = readJsonFile(path.join(dir, "result.json"));
+  const readResult = () => readJsonFile(path.join(dir, "result.json"));
+  let result = readResult();
   let state;
   if (result) state = "done";
   else if (meta?.pid ? isOurProcess(meta.pid) : Date.now() - stat.mtimeMs < (PREP_TIMEOUT + 30) * 1000) state = "running";
+  // The job writes result.json right before it exits. If it finished between the read above and the process
+  // check, the process is already gone, and without a second read a fast answer would look broken off.
+  else if ((result = readResult())) state = "done";
   else state = "lost"; // the process ended without leaving an answer
   return { dir, meta: meta ?? {}, result, state };
 }
