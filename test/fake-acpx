@@ -1,0 +1,125 @@
+#!/usr/bin/env node
+// Fake acpx for the resource-agent tests: answers without an agent or a model.
+// Every call (arguments and relevant environment variables) is appended to $FAKE_ACPX_DIR/calls.jsonl,
+// conversation records are kept in $FAKE_ACPX_DIR/records/.
+// A question containing SLOW is answered after $FAKE_ACPX_SLOW_MS ms (2000 by default) unless the cancel
+// command comes first; a question containing DENIED exits with code 5, like a permission denial.
+// $FAKE_ACPX_HISTORY_BYTES adds a message history of that size to the sessions show output,
+// like the real acpx, which prints the whole conversation record.
+"use strict";
+
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+
+const dir = process.env.FAKE_ACPX_DIR;
+const args = process.argv.slice(2);
+const logged = ["OPENCODE_CONFIG_CONTENT", "OPENCODE_DISABLE_AUTOUPDATE", "RESOURCE_AGENT_CHAT", "RESOURCE_AGENT_SESSION", "OPENCODE_SESSION_ID", "OPENCODE_PERMISSION"];
+fs.mkdirSync(path.join(dir, "records"), { recursive: true });
+fs.appendFileSync(
+  path.join(dir, "calls.jsonl"),
+  `${JSON.stringify({ args, env: Object.fromEntries(logged.map((name) => [name, process.env[name]])) })}\n`,
+);
+
+if (args[0] === "--version") {
+  console.log("0.19.4-fake");
+  process.exit(0);
+}
+
+const withValue = new Set(["--cwd", "--agent", "--format", "--timeout", "--ttl", "--model"]);
+const options = {};
+let i = 0;
+while (i < args.length && args[i].startsWith("--")) {
+  if (withValue.has(args[i])) {
+    options[args[i].slice(2)] = args[i + 1];
+    i += 2;
+  } else {
+    options[args[i].slice(2)] = true;
+    i += 1;
+  }
+}
+const [command, ...rest] = args.slice(i);
+const flag = (name) => {
+  const at = rest.indexOf(name);
+  return at === -1 ? undefined : rest[at + 1];
+};
+const safe = (name) => name.replace(/[^A-Za-z0-9_.-]/g, "_");
+const recordFile = (name) => path.join(dir, "records", `${safe(name)}.json`);
+const cancelFile = (name) => path.join(dir, `cancel-${safe(name)}`);
+const readRecord = (name) => (fs.existsSync(recordFile(name)) ? JSON.parse(fs.readFileSync(recordFile(name), "utf8")) : undefined);
+const writeRecord = (record) => fs.writeFileSync(recordFile(record.name), JSON.stringify(record));
+const noSession = (name) => {
+  process.stderr.write(`[acpx] error: NO_SESSION ${name}\n`);
+  process.exit(4);
+};
+
+if (command === "sessions") {
+  const [sub, maybeName] = rest;
+  if (sub === "show") {
+    const record = readRecord(maybeName);
+    if (!record) noSession(maybeName);
+    const history = Number(process.env.FAKE_ACPX_HISTORY_BYTES ?? 0);
+    process.stdout.write(`${JSON.stringify({ ...record, messages: history ? ["x".repeat(history)] : [] })}\n`);
+  } else if (sub === "ensure" || sub === "new") {
+    const name = flag("--name");
+    const existing = readRecord(name);
+    if (sub === "ensure" && existing && !existing.closed) {
+      console.log(JSON.stringify({ action: "session_ensured", created: false, name }));
+    } else {
+      writeRecord({
+        acpxRecordId: crypto.randomUUID(),
+        name,
+        closed: false,
+        acpx: { desired_config_options: {}, current_model_id: options.model ?? "fake/default" },
+      });
+      console.log(JSON.stringify({ action: "session_ensured", created: true, name }));
+    }
+  } else {
+    process.stderr.write(`fake-acpx: sessions ${sub} is not supported\n`);
+    process.exit(2);
+  }
+} else if (command === "set") {
+  const [key, value] = rest;
+  const name = flag("-s");
+  const record = readRecord(name);
+  if (!record) noSession(name);
+  if (key === "mode") record.acpx.desired_config_options.mode = value;
+  else if (key === "model") record.acpx.current_model_id = value;
+  writeRecord(record);
+  console.log(JSON.stringify({ action: "config_set", configId: key, value }));
+} else if (command === "cancel") {
+  fs.writeFileSync(cancelFile(flag("-s")), "");
+  console.log(JSON.stringify({ action: "cancel_requested" }));
+} else if (command === "prompt") {
+  const name = flag("-s");
+  if (!readRecord(name)) noSession(name);
+  const question = fs.readFileSync(flag("-f"), "utf8");
+  const finish = () => {
+    if (question.includes("DENIED")) {
+      process.stderr.write("[acpx] error: permission denied\n");
+      process.exit(5);
+    }
+    console.log(`answer: ${question.trim()}`);
+    process.stderr.write("[acpx] tokens: input=1 output=1\n");
+    process.exit(0);
+  };
+  process.on("SIGINT", () => process.exit(130));
+  if (!question.includes("SLOW")) finish();
+  else {
+    const deadline = Date.now() + Number(process.env.FAKE_ACPX_SLOW_MS ?? 2000);
+    const timer = setInterval(() => {
+      if (fs.existsSync(cancelFile(name))) {
+        fs.rmSync(cancelFile(name));
+        process.stderr.write("[acpx] error: cancelled\n");
+        process.exit(130);
+      }
+      if (Date.now() >= deadline) {
+        clearInterval(timer);
+        finish();
+      }
+    }, 100);
+  }
+} else {
+  process.stderr.write(`fake-acpx: command ${command} is not supported\n`);
+  process.exit(2);
+}

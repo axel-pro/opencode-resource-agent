@@ -1,0 +1,44 @@
+{
+  "name": "opencode-resource-agent",
+  "version": "0.1.0",
+  "description": "OpenCode plugin and CLI for asking the agents of other repositories: questions and edits over ACP via acpx",
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "acp",
+    "acpx",
+    "agents",
+    "multi-repo"
+  ],
+  "homepage": "https://github.com/axel-pro/opencode-resource-agent#readme",
+  "bugs": {
+    "url": "https://github.com/axel-pro/opencode-resource-agent/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/axel-pro/opencode-resource-agent.git"
+  },
+  "license": "MIT",
+  "author": "Mikhail Badin",
+  "main": "src/index.ts",
+  "bin": {
+    "resource-agent": "bin/resource-agent"
+  },
+  "files": [
+    "bin",
+    "src",
+    "skills"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=22.13.0",
+    "opencode": "^1.18.0"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.18.35",
+    "acpx": "0.19.4"
+  },
+  "private": true
+}

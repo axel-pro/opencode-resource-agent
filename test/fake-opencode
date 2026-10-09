@@ -1,0 +1,10 @@
+#!/usr/bin/env node
+// Fake opencode for the resource-agent tests: only knows --version.
+"use strict";
+
+if (process.argv[2] === "--version") {
+  console.log(process.env.FAKE_OPENCODE_VERSION ?? "1.18.35");
+  process.exit(0);
+}
+process.stderr.write("fake-opencode: only --version is supported\n");
+process.exit(1);

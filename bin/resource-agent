@@ -1,0 +1,1155 @@
+#!/usr/bin/env node
+// resource-agent — the transport: asks an agent of another repository a question and returns its answer.
+//
+// The agent of another repository is OpenCode started in that repository's folder through acpx
+// (a command-line client for the ACP protocol). It sees its own AGENTS.md, skills and MCP servers.
+// Where the repositories live and how to reach them is described in the config of the asking project:
+//   .opencode/resources.jsonc        — shared, committed to git;
+//   .opencode/resources.local.jsonc  — personal (paths, model), merged on top of the shared one.
+// The project is the nearest folder with .opencode/resources.jsonc, starting from the current one (see findProjectRoot).
+// The script is not tied to OpenCode as a client: it is called by the resource_agent tool
+// (src/index.ts in this package), by a person from a terminal, or by any other agent.
+// Besides questions, a resource agent can be asked to edit its repository (build mode).
+//
+// A question runs in a background process, and the script waits for the answer no longer than options.wait seconds.
+// If the answer is not ready by then, the script exits with code 75, and the answer is collected later with --wait.
+// This way a long question does not hit OpenCode's shell command limit (10 minutes) and does not block the caller.
+"use strict";
+
+const { spawn, spawnSync } = require("node:child_process");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const USAGE = `Usage:
+  resource-agent <resource> [--mode plan|build] '<question>'  ask a question; '-' instead of the question reads it from stdin
+  resource-agent <resource> --wait                            wait for the answer to a question still in progress
+  resource-agent <resource> --cancel                          cancel a question still in progress
+  resource-agent <resource> --new                             start this chat's conversation with the resource over
+  resource-agent status                                       check the environment, resources and questions in progress
+  resource-agent resources [--json]                           list resources
+  resource-agent profile <resource> [--mode plan|build]       show what the resource agent gets; does not call the model
+  resource-agent init                                         create missing config files and .gitignore lines
+
+Modes: plan — the agent only reads (default); build — it may edit files in its repository.
+Exit codes: 0 — answer received; 75 — the agent is still working, collect the answer with --wait;
+  76 — the conversation is busy with a previous question; 2 — invalid invocation or config; 3, 5, 130 — acpx codes.
+Environment: RESOURCE_AGENT_CHAT, RESOURCE_AGENT_SESSION — whose conversation this is;
+  RESOURCE_AGENT_WAIT, RESOURCE_AGENT_TIMEOUT, RESOURCE_AGENT_TTL — times, s; ACPX_BIN, OPENCODE_BIN — program paths.
+`;
+
+// The nearest folder with a resources config, starting from start. The script lives in the package, while the config
+// and conversation state live in the asking project: this way the script finds the project both from the plugin
+// and from a terminal opened in any subfolder.
+function findProjectRoot(start) {
+  for (let dir = path.resolve(start); ; dir = path.dirname(dir)) {
+    if (fs.existsSync(path.join(dir, ".opencode", "resources.jsonc"))) return dir;
+    if (path.dirname(dir) === dir) return undefined;
+  }
+}
+
+function gitRoot(start) {
+  const result = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: start, encoding: "utf8" });
+  return result.status === 0 ? result.stdout.trim() : undefined;
+}
+
+// Without a config the root is the git repository root, and outside git the current folder: init puts
+// the templates there, and paths in error messages are relative to it.
+const ROOT = findProjectRoot(process.cwd()) ?? gitRoot(process.cwd()) ?? process.cwd();
+const CONFIG_DIR = path.join(ROOT, ".opencode");
+const CONFIG_FILE = path.join(CONFIG_DIR, "resources.jsonc");
+const LOCAL_FILE = path.join(CONFIG_DIR, "resources.local.jsonc");
+const EXAMPLE_FILE = path.join(CONFIG_DIR, "resources.local.example.jsonc");
+const STATE_DIR = path.join(CONFIG_DIR, ".state");
+
+// Prefix of conversation names in acpx: it shows that the conversation was started by resource-agent.
+const CLIENT = "resource-agent";
+const COMMANDS = new Set(["status", "resources", "profile", "init", "help", "__job"]);
+const MODES = ["plan", "build"];
+const DEFAULT_OPTIONS = { wait: 450, timeout: 3600, ttl: 1800 };
+// Limit for preparing a conversation, s: the first OpenCode start in a repository installs its plugins' dependencies.
+const PREP_TIMEOUT = 120;
+// Output limit for service commands, bytes. acpx sessions show prints the conversation record with the whole
+// message history, and after a few dozen questions it outgrows 1 MB, the spawnSync default.
+const MAX_OUTPUT = 256 * 1024 * 1024;
+const EXIT = { USAGE: 2, PENDING: 75, BUSY: 76 };
+
+// Variables that must not reach the resource agent: they are settings of the asking project and its OpenCode,
+// and would hijack the conversation, disable the resource's plugins or weaken its permissions.
+const CHILD_ENV_DROP = [
+  "RESOURCE_AGENT_CHAT",
+  "RESOURCE_AGENT_SESSION",
+  "OPENCODE_SESSION_ID",
+  "OPENCODE_PURE",
+  "OPENCODE_PERMISSION",
+  "OPENCODE_DISABLE_PROJECT_CONFIG",
+  "OPENCODE_CLIENT",
+];
+
+// Files the resource agent cannot edit even in build mode: the repository's own configs and instructions.
+// Otherwise the agent could change its plugin, and on the next start that plugin would run without
+// any restrictions. In OpenCode patterns "*" matches any part of a path, including "/".
+const PROTECTED_FILES = [
+  ".opencode/*",
+  "*/.opencode/*",
+  ".git/*",
+  "*/.git/*",
+  "*opencode.json",
+  "*opencode.jsonc",
+  "*AGENTS.md",
+  "*CLAUDE.md",
+];
+
+class AskError extends Error {
+  constructor(message, code = EXIT.USAGE) {
+    super(message);
+    this.code = code;
+  }
+}
+
+const fail = (message, code = EXIT.USAGE) => {
+  throw new AskError(message, code);
+};
+const out = (text) => process.stdout.write(`${text}\n`);
+const warn = (text) => process.stderr.write(`resource-agent: ${text}\n`);
+const rel = (file) => path.relative(ROOT, file);
+const isObject = (value) => value !== null && typeof value === "object" && !Array.isArray(value);
+const sha = (text) => crypto.createHash("sha256").update(text).digest("hex").slice(0, 16);
+
+// ---------------------------------------------------------------- config
+
+// Strips // and /* */ comments from JSONC without touching strings: "http://host" stays as is.
+// Line breaks are kept so that positions in JSON errors match the file.
+function stripJsonComments(text) {
+  let result = "";
+  let inString = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      result += ch;
+      if (ch === "\\") result += text[++i] ?? "";
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') {
+      inString = true;
+      result += ch;
+    } else if (ch === "/" && text[i + 1] === "/") {
+      while (i + 1 < text.length && text[i + 1] !== "\n") i++;
+    } else if (ch === "/" && text[i + 1] === "*") {
+      const end = text.indexOf("*/", i + 2);
+      if (end === -1) throw new SyntaxError("unterminated /* comment");
+      result += text.slice(i, end + 2).replace(/[^\n]/g, " ");
+      i = end + 1;
+    } else {
+      result += ch;
+    }
+  }
+  return result;
+}
+
+function readJsonc(file) {
+  let text;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch (error) {
+    if (error.code === "ENOENT") return undefined;
+    throw error;
+  }
+  try {
+    return JSON.parse(stripJsonComments(text));
+  } catch (error) {
+    fail(`${rel(file)}: ${error.message}`);
+  }
+}
+
+// The personal file is merged on top of the shared one: objects are merged, arrays and values are replaced,
+// null removes a key.
+function merge(base, over) {
+  if (over === undefined) return base;
+  if (!isObject(base) || !isObject(over)) return over;
+  const result = { ...base };
+  for (const [key, value] of Object.entries(over)) {
+    if (value === null) delete result[key];
+    else result[key] = merge(base[key], value);
+  }
+  return result;
+}
+
+function loadConfig() {
+  const shared = readJsonc(CONFIG_FILE);
+  if (shared === undefined) fail(`no .opencode/resources.jsonc in ${process.cwd()} or any folder above — run from a project with a resources config or create a template: resource-agent init`);
+  const config = merge(shared, readJsonc(LOCAL_FILE) ?? {});
+  const errors = validate(config);
+  if (errors.length) fail(`config errors:\n  - ${errors.join("\n  - ")}`);
+  const options = { ...DEFAULT_OPTIONS, ...config.options };
+  for (const [key, name] of [["wait", "RESOURCE_AGENT_WAIT"], ["timeout", "RESOURCE_AGENT_TIMEOUT"], ["ttl", "RESOURCE_AGENT_TTL"]]) {
+    if (process.env[name] === undefined) continue;
+    const value = Number(process.env[name]);
+    if (!Number.isFinite(value) || value < 0) fail(`${name}: expected a non-negative number of seconds`);
+    options[key] = value;
+  }
+  return { options, resources: config.resources };
+}
+
+function validate(config) {
+  const errors = [];
+  if (config.version !== 1) errors.push(`version: only 1 is supported, got ${JSON.stringify(config.version)}`);
+  if (config.options !== undefined) {
+    if (!isObject(config.options)) errors.push("options: expected an object");
+    else {
+      for (const [key, value] of Object.entries(config.options)) {
+        if (!(key in DEFAULT_OPTIONS)) errors.push(`options.${key}: unknown option`);
+        else if (typeof value !== "number" || !(value >= 0)) errors.push(`options.${key}: expected a non-negative number of seconds`);
+      }
+    }
+  }
+  if (!isObject(config.resources)) {
+    errors.push("resources: expected an object");
+    return errors;
+  }
+  const owners = new Map(); // name or alias -> the resource it belongs to
+  const claim = (key, name, where) => {
+    if (COMMANDS.has(key)) errors.push(`${where}: "${key}" clashes with a script command`);
+    const owner = owners.get(key);
+    if (owner && owner !== name) errors.push(`${where}: "${key}" is already taken by resource ${owner}`);
+    owners.set(key, name);
+  };
+  for (const [name, resource] of Object.entries(config.resources)) {
+    const where = `resources.${name}`;
+    if (!/^[a-z0-9-]+$/.test(name)) errors.push(`${where}: a name may only contain a-z, 0-9 and "-"`);
+    claim(name, name, where);
+    if (!isObject(resource)) {
+      errors.push(`${where}: expected an object`);
+      continue;
+    }
+    if (resource.description !== undefined && typeof resource.description !== "string") {
+      errors.push(`${where}.description: expected a string`);
+    }
+    if (resource.aliases !== undefined && !Array.isArray(resource.aliases)) errors.push(`${where}.aliases: expected an array`);
+    for (const alias of resource.aliases ?? []) {
+      if (typeof alias !== "string" || !alias.trim()) errors.push(`${where}.aliases: expected non-empty strings`);
+      else claim(alias.trim().toLowerCase(), name, `${where}.aliases`);
+    }
+    // Tags are topics by which the asking agent picks a resource. Unlike aliases, they do not address
+    // a resource and may repeat across resources, so they do not take part in claim.
+    if (resource.tags !== undefined && !Array.isArray(resource.tags)) errors.push(`${where}.tags: expected an array`);
+    else if ((resource.tags ?? []).some((tag) => typeof tag !== "string" || !tag.trim())) {
+      errors.push(`${where}.tags: expected non-empty strings`);
+    }
+    const location = resource.location;
+    if (!isObject(location)) {
+      errors.push(`${where}.location: expected an object`);
+      continue;
+    }
+    const transport = TRANSPORTS[location.type];
+    if (!transport) {
+      const known = Object.keys(TRANSPORTS).join(", ");
+      errors.push(`${where}.location.type: unknown transport ${JSON.stringify(location.type)}; available: ${known}`);
+      continue;
+    }
+    errors.push(...transport.validate(location, `${where}.location`));
+  }
+  return errors;
+}
+
+function findResource(config, key) {
+  const wanted = String(key).trim().toLowerCase();
+  for (const [name, resource] of Object.entries(config.resources)) {
+    const aliases = (resource.aliases ?? []).map((alias) => alias.trim().toLowerCase());
+    if (name === wanted || aliases.includes(wanted)) return { name, ...resource };
+  }
+  const known = Object.entries(config.resources)
+    .map(([name, resource]) => [name, ...(resource.aliases ?? [])].join("/"))
+    .join(", ");
+  fail(`unknown resource "${key}". Known: ${known || "(the config is empty)"}`);
+}
+
+// ---------------------------------------------------------------- transports
+
+// A transport is a way to deliver a question to a resource agent. The key is location.type in the config.
+// Each transport describes:
+//   build      — whether it supports build mode (editing files);
+//   validate   — errors in the location settings;
+//   locate     — how to start the agent: the command for acpx (agentCommand), the session folder (cwd),
+//                the agent's environment (env), the address for the source line (where),
+//                details about the code checkout (details) and the agent version check (checkAgent).
+// Asking, waiting, cancelling and resetting a conversation are shared by all acpx-based transports.
+// A future transport, such as ssh to an agent server, goes here: permissions there are set by a profile
+// on the server, so it does not need location.permission.
+const TRANSPORTS = {
+  local: {
+    build: true,
+    validate(location, where) {
+      const errors = [];
+      if (typeof location.path !== "string" || !location.path) errors.push(`${where}.path: expected a path to the local checkout`);
+      if (location.model !== undefined && (typeof location.model !== "string" || !location.model)) {
+        errors.push(`${where}.model: expected a string like provider/model`);
+      }
+      if (location.permission !== undefined) {
+        if (!isObject(location.permission)) errors.push(`${where}.permission: expected an object of OpenCode rules`);
+        for (const key of askRules(location.permission)) {
+          errors.push(`${where}.permission.${key}: "ask" is not supported, there is nobody to confirm; use allow or deny`);
+        }
+      }
+      const unknown = Object.keys(location).filter((key) => !["type", "path", "model", "permission"].includes(key));
+      if (unknown.length) errors.push(`${where}: unknown fields ${unknown.join(", ")}`);
+      return errors;
+    },
+    locate(resource) {
+      const dir = resolvePath(resource.location.path);
+      if (!fs.existsSync(dir)) {
+        fail(`${resource.name}: folder ${dir} does not exist — clone the repository or set the path in ${rel(LOCAL_FILE)}`);
+      }
+      const cwd = fs.realpathSync(dir);
+      if (cwd === fs.realpathSync(ROOT)) fail(`${resource.name}: the path points to the project itself, ${ROOT}`);
+      return {
+        agentCommand: `${quoteArg(opencodeBin())} acp`,
+        cwd,
+        env: {
+          OPENCODE_CONFIG_CONTENT: JSON.stringify(opencodeProfile(resource.location.permission)),
+          OPENCODE_DISABLE_AUTOUPDATE: "1",
+        },
+        where: cwd,
+        details: () => gitDetails(cwd),
+        checkAgent: checkOpencodeVersion,
+      };
+    },
+  },
+};
+
+// The resource agent's profile for OpenCode 1.x. It is passed through OPENCODE_CONFIG_CONTENT: OpenCode applies it
+// on top of the repository's own opencode.json, and the repository cannot weaken it. Rules are set for the plan
+// and build agents too: built-in agents have their own default rules, and those take precedence over global ones.
+// No rule is left at "ask": acpx runs with --deny-all and would reject such a request,
+// and then exit with an error even if the answer was ready.
+function opencodeProfile(extra = {}) {
+  const common = {
+    bash: "deny",
+    webfetch: "deny",
+    websearch: "deny",
+    task: "deny", // the repository's own subagents may have broader permissions
+    external_directory: "deny",
+    question: "deny", // there is nobody to ask back: the question came from another agent
+    doom_loop: "deny",
+    plan_enter: "deny", // otherwise the agent could switch itself from plan to build
+    plan_exit: "deny",
+    read: { "*": "allow", "*.env": "deny", "*.env.*": "deny", "*.env.example": "allow" },
+  };
+  const protectedEdits = Object.fromEntries(PROTECTED_FILES.map((pattern) => [pattern, "deny"]));
+  const plan = merge({ ...common, edit: "deny" }, extra);
+  const build = merge({ ...common, edit: { "*": "allow", ...protectedEdits } }, extra);
+  return { default_agent: "plan", permission: plan, agent: { plan: { permission: plan }, build: { permission: build } } };
+}
+
+function askRules(rules, prefix = "") {
+  const found = [];
+  for (const [key, value] of Object.entries(rules ?? {})) {
+    const name = prefix ? `${prefix}.${key}` : key;
+    if (value === "ask") found.push(name);
+    else if (isObject(value)) found.push(...askRules(value, name));
+  }
+  return found;
+}
+
+// ---------------------------------------------------------------- programs and environment
+
+function resolvePath(value) {
+  const expanded = value === "~" ? os.homedir() : value.startsWith("~/") ? path.join(os.homedir(), value.slice(2)) : value;
+  return path.resolve(ROOT, expanded);
+}
+
+// A path in the agent command is wrapped in double quotes: acpx splits this string into arguments itself.
+const quoteArg = (value) => (/\s/.test(value) ? `"${value}"` : value);
+// An argument shown as part of a shell command that can be copied.
+const shellQuote = (value) => (/^[\w@%+=:,./-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`);
+
+function isExecutable(file) {
+  try {
+    fs.accessSync(file, fs.constants.X_OK);
+    return fs.statSync(file).isFile();
+  } catch {
+    return false;
+  }
+}
+
+function which(command) {
+  for (const dir of (process.env.PATH ?? "").split(path.delimiter)) {
+    if (dir && isExecutable(path.join(dir, command))) return path.join(dir, command);
+  }
+  return undefined;
+}
+
+// The path to opencode is not resolved to the real file: the agent command is part of the acpx conversation key,
+// and after an OpenCode update conversations must still be found under the same path.
+let opencodePath;
+function opencodeBin() {
+  if (opencodePath) return opencodePath;
+  const candidates = process.env.OPENCODE_BIN
+    ? [process.env.OPENCODE_BIN]
+    : [which("opencode"), path.join(os.homedir(), ".opencode", "bin", "opencode")];
+  opencodePath = candidates.find((file) => file && isExecutable(file));
+  if (!opencodePath) fail("opencode not found: install OpenCode 1.x or set its path in OPENCODE_BIN", 1);
+  return opencodePath;
+}
+
+function opencodeVersion() {
+  const result = spawnSync(opencodeBin(), ["--version"], { encoding: "utf8", timeout: 30_000 });
+  return /^\d+\.\d+\.\d+\S*/.exec((result.stdout ?? "").trim())?.[0];
+}
+
+// The permission profile is written in the OpenCode 1.x format; 2.x would silently ignore it, so refusing is safer.
+function checkOpencodeVersion() {
+  const version = opencodeVersion();
+  if (!version) warn("could not determine the opencode version; the permission profile targets 1.x");
+  else if (Number(version.split(".")[0]) >= 2) {
+    fail(`found OpenCode ${version}, but the agent permission profile targets 1.x — set OpenCode 1.x in OPENCODE_BIN`, 1);
+  }
+}
+
+// acpx is a dependency of the package. Where it lives depends on how the package was installed (npm workspace,
+// OpenCode plugin cache), so the path comes from Node rather than being built from the script folder.
+function acpxBin() {
+  if (process.env.ACPX_BIN) return process.env.ACPX_BIN;
+  let manifest;
+  try {
+    manifest = require.resolve("acpx/package.json");
+  } catch {
+    fail("acpx is not installed: install the package dependencies (npm install)", 1);
+  }
+  const { bin } = JSON.parse(fs.readFileSync(manifest, "utf8"));
+  return path.join(path.dirname(manifest), typeof bin === "string" ? bin : bin.acpx);
+}
+
+function git(cwd, ...args) {
+  // Without a large maxBuffer, git status in a folder with thousands of untracked files would be cut off,
+  // and a checkout with changes would look clean.
+  const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf8", maxBuffer: MAX_OUTPUT });
+  return result.status === 0 ? result.stdout.trim() : "";
+}
+
+function gitDetails(cwd) {
+  const branch = git(cwd, "rev-parse", "--abbrev-ref", "HEAD");
+  if (!branch) return "not git";
+  return git(cwd, "status", "--porcelain") ? `${branch}, uncommitted changes` : branch;
+}
+
+function agentEnv(target) {
+  const env = { ...process.env, ...target.env };
+  for (const name of CHILD_ENV_DROP) delete env[name];
+  return env;
+}
+
+// ---------------------------------------------------------------- conversation
+
+// A conversation with a resource is bound to the OpenCode chat that asks: a new chat means a new conversation,
+// and continuing a chat continues the conversation even if the agent process ended long ago. Outside OpenCode
+// all calls go to the shared conversation "shared", and RESOURCE_AGENT_SESSION sets the conversation name explicitly.
+let chat;
+function chatId() {
+  chat ??= detectChat();
+  return chat;
+}
+
+function detectChat() {
+  const fixed = process.env.RESOURCE_AGENT_SESSION || process.env.RESOURCE_AGENT_CHAT;
+  if (fixed) return clean(fixed);
+  // OpenCode 2.x passes the session id to commands itself; for a subagent, climb up to its chat.
+  const id = process.env.OPENCODE_SESSION_ID;
+  if (id) return clean(topSession(id));
+  if (process.env.OPENCODE) {
+    warn("OpenCode did not pass a chat id (is the opencode-resource-agent plugin enabled?); the question goes to the shared conversation");
+  }
+  return "shared";
+}
+
+function topSession(id) {
+  for (let depth = 0; depth < 16; depth++) {
+    const result = spawnSync(opencodeBin(), ["api", "GET", `/api/session/${id}`], { encoding: "utf8", timeout: 20_000 });
+    let info;
+    try {
+      info = JSON.parse(result.stdout).data;
+    } catch {}
+    if (!info?.id) {
+      warn(`could not find OpenCode session ${id}; it gets a conversation of its own`);
+      return id;
+    }
+    if (!info.parentID) return id;
+    id = info.parentID;
+  }
+  return id;
+}
+
+const clean = (value) => String(value).replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 80);
+const conversationName = (resource) => `${CLIENT}:${resource.name}:${chatId()}`;
+
+// ---------------------------------------------------------------- acpx
+
+// Permission flags are passed on every call: acpx reads .acpxrc.json from the --cwd folder, that is,
+// from someone else's repository, and without explicit flags its settings would make the decisions.
+// --no-fs and --no-terminal: the agent works only with its own tools, acpx opens nothing to it.
+function acpxArgs(target, args) {
+  return ["--cwd", target.cwd, "--agent", target.agentCommand, "--no-fs", "--no-terminal", "--deny-all", ...args];
+}
+
+function runAcpx(target, args, timeoutSec = PREP_TIMEOUT) {
+  const result = spawnSync(acpxBin(), acpxArgs(target, args), {
+    env: agentEnv(target),
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: (timeoutSec + 30) * 1000,
+    maxBuffer: MAX_OUTPUT,
+  });
+  const command = describeAcpx(args);
+  switch (result.error?.code) {
+    case undefined:
+      return result;
+    case "ETIMEDOUT":
+      fail(`${command}: no response within ${timeoutSec + 30} s`, 1);
+    case "ENOBUFS":
+      fail(`${command}: output exceeds ${MAX_OUTPUT / 1024 / 1024} MB`, 1);
+    default:
+      fail(`could not start acpx: ${result.error.message}`, 1);
+  }
+}
+
+// The command for error messages: "acpx sessions show", without flags and their values.
+function describeAcpx(args) {
+  const withValue = new Set(["--format", "--timeout", "--ttl", "--model"]);
+  const words = [];
+  for (let i = 0; i < args.length && words.length < 2; i++) {
+    if (withValue.has(args[i])) i++;
+    else if (!args[i].startsWith("-")) words.push(args[i]);
+  }
+  return `acpx ${words.join(" ")}`;
+}
+
+function parseJsonOutput(text) {
+  const trimmed = (text ?? "").trim();
+  if (!trimmed) return undefined;
+  try {
+    return JSON.parse(trimmed);
+  } catch {}
+  const last = trimmed.split("\n").filter((line) => line.trim().startsWith("{")).pop();
+  try {
+    return last ? JSON.parse(last) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// A preparation step: creating a conversation, changing the mode or model. An error aborts the question.
+function acpxStep(target, args) {
+  const result = runAcpx(target, ["--format", "json", "--timeout", String(PREP_TIMEOUT), ...args]);
+  const reply = parseJsonOutput(result.stdout);
+  if (result.status !== 0) {
+    const message = reply?.error?.message ?? (result.stderr || result.stdout || "").trim();
+    fail(`${describeAcpx(args)}: ${message || `code ${result.status}`}`, result.status || 1);
+  }
+  return reply;
+}
+
+function sessionRecord(target, conversation) {
+  const result = runAcpx(target, ["--format", "json", "sessions", "show", conversation]);
+  return result.status === 0 ? parseJsonOutput(result.stdout) : undefined;
+}
+
+// Prepares the conversation for a question: creates it if needed, applies changed permissions,
+// sets the mode and model.
+function prepare(ctx, mode, { fresh = false } = {}) {
+  const { resource, target, conversation } = ctx;
+  const model = resource.location.model;
+  let record = fresh ? undefined : sessionRecord(target, conversation);
+  let created = false;
+  if (!record || record.closed) {
+    target.checkAgent?.();
+    if (!model) {
+      warn(`${resource.name}: no model set — the agent will use its OpenCode's default model, which may be an external service. Set location.model in ${rel(LOCAL_FILE)}`);
+    }
+    const modelArgs = model ? ["--model", model] : [];
+    const reply = acpxStep(target, [...modelArgs, "sessions", fresh ? "new" : "ensure", "--name", conversation]);
+    created = fresh || reply?.created !== false;
+    record = sessionRecord(target, conversation);
+  }
+  applyProfile(ctx, record, created);
+  if (record?.acpx?.desired_config_options?.mode !== mode) acpxStep(target, ["set", "mode", mode, "-s", conversation]);
+  if (model && record?.acpx?.current_model_id !== model) acpxStep(target, ["set", "model", model, "-s", conversation]);
+  return { created, model: model ?? record?.acpx?.current_model_id };
+}
+
+// The agent gets its permissions when its process starts. If the profile changed since the last question,
+// the process is stopped: the next acpx call starts the agent with the new permissions and loads the same
+// conversation from disk.
+function applyProfile({ target, conversation }, record, created) {
+  const file = path.join(conversationDir(conversation), "profile.sha");
+  const current = sha(JSON.stringify(target.env));
+  if (!created && readText(file) !== current && record?.acpxRecordId) stopOwner(record.acpxRecordId);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, current);
+}
+
+// The agent process is held by the acpx queue owner. Its pid is written to ~/.acpx/queues/*.lock — an internal
+// detail of acpx 0.19.4. If the file format changes, the process will not be stopped, and the new permissions
+// take effect when the agent exits on its own (after options.ttl).
+function stopOwner(recordId) {
+  const dir = path.join(os.homedir(), ".acpx", "queues");
+  let files = [];
+  try {
+    files = fs.readdirSync(dir).filter((file) => file.endsWith(".lock"));
+  } catch {
+    return;
+  }
+  for (const file of files) {
+    const lock = readJsonFile(path.join(dir, file));
+    if (lock?.sessionId !== recordId || !Number.isInteger(lock.pid)) continue;
+    const isOwner = () => processArgs(lock.pid).includes("__queue-owner");
+    if (!isOwner()) return; // the process is gone, or the pid belongs to someone else
+    try {
+      process.kill(lock.pid, "SIGTERM");
+    } catch {
+      return;
+    }
+    // A process that has exited but not yet been reaped by its parent (a zombie) is alive for kill(pid, 0),
+    // so wait until the queue owner itself disappears.
+    waitSync(() => !isOwner(), 5000);
+    return;
+  }
+}
+
+// ---------------------------------------------------------------- question in progress
+
+// Conversation state lives in .opencode/.state/<conversation>/:
+//   profile.sha — fingerprint of the permissions the agent was started with;
+//   job/        — the question in progress. The folder is created atomically (mkdir fails if it exists),
+//                 and that is the "conversation busy" mark: two simultaneous calls will not send two questions.
+//     meta.json   — resource, mode, model and the pid of the process currently responsible for the question;
+//     question.txt, spec.json — what to ask and how; answer.txt, error.txt — acpx output;
+//     result.json — appears when the question is finished.
+const conversationDir = (conversation) => path.join(STATE_DIR, conversation.replace(/[^A-Za-z0-9_.-]/g, "_"));
+const jobDir = (conversation) => path.join(conversationDir(conversation), "job");
+const clearJob = (conversation) => fs.rmSync(jobDir(conversation), { recursive: true, force: true });
+
+function readJob(conversation) {
+  const dir = jobDir(conversation);
+  let stat;
+  try {
+    stat = fs.statSync(dir);
+  } catch {
+    return undefined;
+  }
+  const meta = readJsonFile(path.join(dir, "meta.json"));
+  const result = readJsonFile(path.join(dir, "result.json"));
+  let state;
+  if (result) state = "done";
+  else if (meta?.pid ? isOurProcess(meta.pid) : Date.now() - stat.mtimeMs < (PREP_TIMEOUT + 30) * 1000) state = "running";
+  else state = "lost"; // the process ended without leaving an answer
+  return { dir, meta: meta ?? {}, result, state };
+}
+
+function busy({ resource }, job) {
+  const what = job?.state === "done" ? "the answer to the previous question is ready but not collected yet" : "the agent is still answering the previous question";
+  out(`${resource.name}: ${what}. Collect the answer: resource-agent ${resource.name} --wait — or cancel the question: resource-agent ${resource.name} --cancel`);
+  return EXIT.BUSY;
+}
+
+// Takes the conversation. Returns false if another call has already taken it.
+function claimConversation(ctx) {
+  const previous = readJob(ctx.conversation);
+  if (previous?.state === "lost") {
+    clearJob(ctx.conversation);
+    warn(`${ctx.resource.name}: the previous question broke off without an answer`);
+  } else if (previous) {
+    return false;
+  }
+  fs.mkdirSync(conversationDir(ctx.conversation), { recursive: true });
+  try {
+    fs.mkdirSync(jobDir(ctx.conversation));
+  } catch (error) {
+    if (error.code === "EEXIST") return false;
+    throw error;
+  }
+  writeJson(path.join(jobDir(ctx.conversation), "meta.json"), { pid: process.pid });
+  return true;
+}
+
+async function ask(ctx, mode, question) {
+  const { conversation } = ctx;
+  if (!claimConversation(ctx)) return busy(ctx, readJob(conversation));
+  const dir = jobDir(conversation);
+  try {
+    const { created, model } = prepare(ctx, mode);
+    fs.writeFileSync(path.join(dir, "question.txt"), question);
+    const meta = { resource: ctx.resource.name, mode, model, created, startedAt: new Date().toISOString() };
+    const pid = startJob(ctx, dir);
+    writeJson(path.join(dir, "meta.json"), { ...meta, pid });
+  } catch (error) {
+    clearJob(conversation);
+    throw error;
+  }
+  return waitForAnswer(ctx);
+}
+
+function startJob({ target, conversation, options }, dir) {
+  const timeout = options.timeout > 0 ? ["--timeout", String(options.timeout)] : [];
+  const args = acpxArgs(target, [
+    "--format", "quiet",
+    "--ttl", String(options.ttl),
+    ...timeout,
+    "prompt", "-s", conversation, "-f", path.join(dir, "question.txt"),
+  ]);
+  writeJson(path.join(dir, "spec.json"), { acpx: acpxBin(), args });
+  const child = spawn(process.execPath, [__filename, "__job", dir], { detached: true, stdio: "ignore", env: agentEnv(target) });
+  child.unref();
+  return child.pid;
+}
+
+// The background process of one question: runs acpx, saves its output to files and writes result.json.
+// It is separate from the resource-agent call, so the question does not depend on whether anyone waits for it.
+function runJob(dir) {
+  if (!dir) fail("__job: no question folder given");
+  const spec = readJsonFile(path.join(dir, "spec.json"));
+  if (!spec) fail(`__job: no ${path.join(dir, "spec.json")}`);
+  const stdout = fs.openSync(path.join(dir, "answer.txt"), "w");
+  const stderr = fs.openSync(path.join(dir, "error.txt"), "w");
+  const result = spawnSync(spec.acpx, spec.args, { stdio: ["ignore", stdout, stderr] });
+  try {
+    writeJson(path.join(dir, "result.json"), {
+      code: result.status ?? 130,
+      signal: result.signal ?? null,
+      error: result.error?.message ?? null,
+      finishedAt: new Date().toISOString(),
+    });
+  } catch {
+    // --cancel has already removed the folder
+  }
+  return 0;
+}
+
+async function waitForAnswer(ctx) {
+  const { resource, conversation, options } = ctx;
+  const deadline = Date.now() + options.wait * 1000;
+  for (;;) {
+    const job = readJob(conversation);
+    if (!job) {
+      out(`${resource.name}: no questions in progress`);
+      return 0;
+    }
+    if (job.state === "done") return deliver(ctx, job);
+    if (job.state === "lost") {
+      clearJob(conversation);
+      fail(`${resource.name}: the question broke off — the process ended without an answer. Ask again`, 1);
+    }
+    if (Date.now() >= deadline) {
+      out(`${resource.name}: the agent is still working on the question (waited ${options.wait} s). Collect the answer later: resource-agent ${resource.name} --wait`);
+      return EXIT.PENDING;
+    }
+    await sleep(Math.min(500, deadline - Date.now()));
+  }
+}
+
+function deliver(ctx, job) {
+  const answer = (readText(path.join(job.dir, "answer.txt")) ?? "").trim();
+  const errors = (readText(path.join(job.dir, "error.txt")) ?? "")
+    .split("\n")
+    .filter((line) => line.trim() && !line.startsWith("[acpx] tokens:"))
+    .join("\n");
+  clearJob(ctx.conversation);
+  const code = job.result.code;
+  out(sourceLine(ctx, job.meta));
+  if (answer) out(answer);
+  if (code !== 0) {
+    if (errors) process.stderr.write(`${errors}\n`);
+    warn(explainExit(code, ctx.options));
+  }
+  return code;
+}
+
+function explainExit(code, options) {
+  switch (code) {
+    case 3:
+      return `the agent did not finish within the ${options.timeout} s limit per question (options.timeout)`;
+    case 4:
+      return "acpx did not find the conversation; ask again";
+    case 5:
+      return "the agent tried to do something its mode's permissions forbid; the answer may be incomplete";
+    case 130:
+      return "the question was interrupted";
+    default:
+      return `acpx exited with code ${code}`;
+  }
+}
+
+async function cancel(ctx) {
+  const { resource, target, conversation } = ctx;
+  const job = readJob(conversation);
+  if (!job) {
+    out(`${resource.name}: no questions in progress`);
+    return 0;
+  }
+  if (job.state === "done") {
+    out(`${resource.name}: the question has already finished, the answer is below`);
+    return deliver(ctx, job);
+  }
+  if (job.state === "running") {
+    // First ask the agent to stop on its own, then interrupt the background process: on SIGINT acpx
+    // also sends the agent a cancellation, and SIGKILL is the last resort.
+    runAcpx(target, ["--timeout", "30", "cancel", "-s", conversation], 30);
+    const stopped = () => readJob(conversation)?.state !== "running";
+    if (!(await waitAsync(stopped, 15_000)) && job.meta.pid) {
+      signalGroup(job.meta.pid, "SIGINT");
+      if (!(await waitAsync(stopped, 5000))) signalGroup(job.meta.pid, "SIGKILL");
+    }
+  }
+  clearJob(conversation);
+  out(`${resource.name}: question cancelled`);
+  return 0;
+}
+
+function startOver(ctx) {
+  if (!claimConversation(ctx)) return busy(ctx, readJob(ctx.conversation));
+  try {
+    const { model } = prepare(ctx, "plan", { fresh: true });
+    out(sourceLine(ctx, { mode: "plan", model, created: true }));
+  } finally {
+    clearJob(ctx.conversation);
+  }
+  return 0;
+}
+
+// The first line of an answer: which resource answered, where and in which mode.
+function sourceLine({ resource, target }, meta) {
+  const parts = [resource.name, resource.location.type, meta.mode ?? "plan", target.where, target.details()];
+  parts.push(meta.model ? `model ${meta.model}` : "default model");
+  if (meta.created) parts.push("new conversation");
+  return `[${parts.join(" · ")}]`;
+}
+
+// ---------------------------------------------------------------- commands without a question
+
+function status() {
+  let healthy = true;
+  const check = (ok, text) => {
+    if (!ok) healthy = false;
+    out(`  ${ok ? "✓" : "✗"} ${text}`);
+  };
+  out("Environment:");
+  const [major, minor] = process.versions.node.split(".").map(Number);
+  check(major > 22 || (major === 22 && minor >= 13), `Node ${process.versions.node} (22.13 or newer required)`);
+  try {
+    const bin = opencodeBin();
+    const version = opencodeVersion();
+    const ok = Boolean(version) && Number(version.split(".")[0]) === 1;
+    check(ok, `opencode ${version ?? "not responding"} (${bin})${ok ? "" : " — OpenCode 1.x required"}`);
+  } catch (error) {
+    check(false, error.message);
+  }
+  try {
+    const version = spawnSync(acpxBin(), ["--version"], { encoding: "utf8" }).stdout?.trim();
+    check(Boolean(version), version ? `acpx ${version}` : "acpx does not start — install the package dependencies (npm install)");
+  } catch (error) {
+    check(false, error.message);
+  }
+  const hasLocal = fs.existsSync(LOCAL_FILE);
+  check(hasLocal, hasLocal ? `personal file ${rel(LOCAL_FILE)}` : `no personal file ${rel(LOCAL_FILE)} — run resource-agent init`);
+
+  let config;
+  try {
+    config = loadConfig();
+  } catch (error) {
+    if (!(error instanceof AskError)) throw error;
+    out("Config:");
+    check(false, error.message);
+    return 1;
+  }
+  out("Resources:");
+  for (const [name, entry] of Object.entries(config.resources)) {
+    const resource = { name, ...entry };
+    const aliases = entry.aliases?.length ? ` (${entry.aliases.join(", ")})` : "";
+    const model = entry.location.model ? `model ${entry.location.model}` : "no model set — set location.model in the personal file";
+    try {
+      const target = TRANSPORTS[entry.location.type].locate(resource);
+      check(Boolean(entry.location.model), `${name}${aliases} · ${entry.location.type} · ${target.where} · ${target.details()} · ${model}`);
+      const job = readJob(conversationName(resource));
+      if (job) out(`      question in progress: ${{ running: "the agent is answering", done: "answer ready, collect it with --wait", lost: "broke off" }[job.state]}`);
+    } catch (error) {
+      if (!(error instanceof AskError)) throw error;
+      check(false, `${name}${aliases} · ${error.message}`);
+    }
+  }
+  out(`Chat: ${chatId()}`);
+  return healthy ? 0 : 1;
+}
+
+function listResources(config, args) {
+  const list = Object.entries(config.resources).map(([name, entry]) => ({
+    name,
+    aliases: entry.aliases ?? [],
+    description: entry.description ?? "",
+    tags: (entry.tags ?? []).map((tag) => tag.trim()),
+    type: entry.location.type,
+    build: Boolean(TRANSPORTS[entry.location.type].build),
+  }));
+  if (args.includes("--json")) out(JSON.stringify(list));
+  else {
+    for (const r of list) {
+      out(`${r.name}${r.aliases.length ? ` (${r.aliases.join(", ")})` : ""} — ${r.description || "no description"}`);
+      if (r.tags.length) out(`  topics: ${r.tags.join(", ")}`);
+    }
+  }
+  return 0;
+}
+
+function profile(config, args) {
+  const { words, mode } = parseArgs(args);
+  if (words.length !== 1) fail("usage: resource-agent profile <resource> [--mode plan|build]");
+  const resource = findResource(config, words[0]);
+  const target = TRANSPORTS[resource.location.type].locate(resource);
+  out(`Conversation: ${conversationName(resource)}`);
+  out(`Folder: ${target.cwd}`);
+  out(`Agent command: ${target.agentCommand}`);
+  out(`Model: ${resource.location.model ?? "not set"}`);
+  out(`Mode: ${mode}`);
+  out(`acpx call: acpx ${acpxArgs(target, []).map(shellQuote).join(" ")} …`);
+  for (const [name, value] of Object.entries(target.env)) {
+    out(`${name}:`);
+    out(name === "OPENCODE_CONFIG_CONTENT" ? JSON.stringify(JSON.parse(value), null, 2) : value);
+  }
+  return 0;
+}
+
+// Templates for a project that has no resources yet: an empty list and a commented-out example resource.
+// An empty list is a working config: the resource_agent tool loads and says there are no resources yet.
+const SHARED_TEMPLATE = `// Resources are other repositories of the product whose agents can be asked for facts about code,
+// behavior and data. Questions are asked by resource-agent (from OpenCode, by the resource_agent tool).
+//
+// This file is shared and committed to git. Personal settings (your paths, model) go to resources.local.jsonc
+// next to it: that file is merged on top of this one and is not committed.
+// After editing, restart OpenCode: the resource list is added to the tool description at startup.
+{
+  "version": 1,
+  "options": {
+    "wait": 450,     // how long one call waits for an answer, s; if not ready, collect it with --wait
+    "timeout": 3600, // overall limit per question, s
+    "ttl": 1800      // how long the agent process waits for the next question, s; does not affect conversation memory
+  },
+  "resources": {
+    // "backend": {
+    //   "description": "Backend (FastAPI): API, validation, data storage", // the agent decides whom to ask by this
+    //   "aliases": ["back"],              // other names of the resource; must be unique
+    //   "tags": ["/orders", "MAX_VALUE"], // terms showing that a question is for this resource
+    //   "location": {
+    //     "type": "local",                // the agent runs on this machine in a local checkout of the repository
+    //     "path": "../backend"            // relative to the folder that contains .opencode/
+    //   }
+    // }
+  }
+}
+`;
+
+const LOCAL_TEMPLATE = `// Template for personal resource settings. resource-agent init copies it to resources.local.jsonc
+// if that file does not exist yet. That file is not committed to git.
+//
+// The personal file is merged on top of resources.jsonc: objects are merged, values are replaced,
+// null removes a key. Usually it sets the agent model and your own paths to the repositories.
+{
+  "resources": {
+    // "backend": {
+    //   "location": {
+    //     "path": "~/work/backend",  // if your checkout is not where the shared file says
+    //     "model": "provider/model"  // the agent model; without it OpenCode uses its default model
+    //   }
+    // }
+  }
+}
+`;
+
+// The personal file and the conversation state must not get into git.
+const GITIGNORE_LINES = [".opencode/resources.local.jsonc", ".opencode/.state/"];
+
+// Creates what is missing and overwrites nothing: safe to run again in a configured project.
+function init() {
+  const createFile = (file, text, note = "") => {
+    if (fs.existsSync(file)) return false;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, text);
+    out(`created ${rel(file)}${note}`);
+    return true;
+  };
+  createFile(CONFIG_FILE, SHARED_TEMPLATE, ": describe the resources in it, there is an example inside");
+  createFile(EXAMPLE_FILE, LOCAL_TEMPLATE);
+  const note = ": set the model in it and, if needed, your own paths to the repositories";
+  if (!createFile(LOCAL_FILE, fs.readFileSync(EXAMPLE_FILE, "utf8"), note)) out(`${rel(LOCAL_FILE)} already exists`);
+
+  const gitignore = path.join(ROOT, ".gitignore");
+  const text = readText(gitignore) ?? "";
+  const present = new Set(text.split(/\r?\n/).map((line) => line.trim()));
+  const missing = GITIGNORE_LINES.filter((line) => !present.has(line));
+  if (missing.length) {
+    const prefix = text && !text.endsWith("\n") ? "\n" : "";
+    fs.appendFileSync(gitignore, `${prefix}# personal resource settings and resource-agent state\n${missing.join("\n")}\n`);
+    out(`${rel(gitignore)}: added ${missing.join(", ")}`);
+  }
+  return 0;
+}
+
+// ---------------------------------------------------------------- argument parsing
+
+function parseArgs(args) {
+  const parsed = { action: "ask", mode: "plan", words: [], stdin: false };
+  const setAction = (action) => {
+    if (parsed.action !== "ask") fail("use only one of --wait, --cancel, --new");
+    parsed.action = action;
+  };
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "--") {
+      parsed.words.push(...args.slice(i + 1));
+      break;
+    }
+    if (arg === "--wait" || arg === "--cancel" || arg === "--new") setAction(arg.slice(2));
+    else if (arg === "--mode" || arg.startsWith("--mode=")) {
+      const value = arg.includes("=") ? arg.slice("--mode=".length) : args[++i];
+      if (!MODES.includes(value)) fail(`--mode: allowed values are ${MODES.join(" and ")}`);
+      parsed.mode = value;
+    } else if (arg === "-") parsed.stdin = true;
+    else if (arg.startsWith("-")) {
+      fail(`unknown flag ${arg}. If the question starts with "-", pass it through stdin or after "--"`);
+    } else parsed.words.push(arg);
+  }
+  return parsed;
+}
+
+// ---------------------------------------------------------------- helpers
+
+function readText(file) {
+  try {
+    return fs.readFileSync(file, "utf8");
+  } catch {
+    return undefined;
+  }
+}
+
+function readJsonFile(file) {
+  const text = readText(file);
+  if (text === undefined) return undefined;
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}
+
+// Write through a temporary file and a rename: a reader never sees a half-written file.
+function writeJson(file, value) {
+  const temp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify(value, null, 2));
+  fs.renameSync(temp, file);
+}
+
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error.code === "EPERM";
+  }
+}
+
+function processArgs(pid) {
+  const result = spawnSync("ps", ["-o", "args=", "-p", String(pid)], { encoding: "utf8" });
+  return result.status === 0 ? result.stdout : "";
+}
+
+// The process is alive and really is resource-agent, not another process that got the same pid.
+// If ps is unavailable, trust that the process is alive.
+function isOurProcess(pid) {
+  if (!isAlive(pid)) return false;
+  const args = processArgs(pid);
+  return !args || args.includes(path.join(path.basename(__dirname), path.basename(__filename)));
+}
+
+function signalGroup(pid, signal) {
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    try {
+      process.kill(pid, signal);
+    } catch {}
+  }
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, Math.max(ms, 1)));
+
+async function waitAsync(condition, ms) {
+  const deadline = Date.now() + ms;
+  while (Date.now() < deadline) {
+    if (condition()) return true;
+    await sleep(250);
+  }
+  return condition();
+}
+
+function waitSync(condition, ms) {
+  const deadline = Date.now() + ms;
+  const cell = new Int32Array(new SharedArrayBuffer(4));
+  while (Date.now() < deadline) {
+    if (condition()) return true;
+    Atomics.wait(cell, 0, 0, 100);
+  }
+  return condition();
+}
+
+// The script used to be called atlas-agent, and its variables started with ATLAS_. Without a warning,
+// ATLAS_WAIT=60, for example, would silently stop working.
+function warnRenamedEnv() {
+  const renamed = Object.keys(process.env).filter((name) => /^ATLAS_(CHAT|SESSION|WAIT|TIMEOUT|TTL)$/.test(name));
+  for (const name of renamed) warn(`${name} has no effect: the variable was renamed to ${name.replace(/^ATLAS_/, "RESOURCE_AGENT_")}`);
+}
+
+// ---------------------------------------------------------------- main
+
+async function main(args) {
+  const [command, ...rest] = args;
+  if (!command || command === "help" || command === "-h" || command === "--help") {
+    process.stdout.write(USAGE);
+    return command ? 0 : EXIT.USAGE;
+  }
+  if (command === "__job") return runJob(rest[0]);
+  warnRenamedEnv();
+  if (command === "init") return init();
+  if (command === "status") return status();
+  const config = loadConfig();
+  if (command === "resources") return listResources(config, rest);
+  if (command === "profile") return profile(config, rest);
+
+  const resource = findResource(config, command);
+  const parsed = parseArgs(rest);
+  const transport = TRANSPORTS[resource.location.type];
+  if (parsed.mode === "build" && !transport.build) fail(`${resource.name}: transport ${resource.location.type} does not support build mode`);
+  const target = transport.locate(resource);
+  const ctx = { resource, target, conversation: conversationName(resource), options: config.options };
+
+  if (parsed.action !== "ask") {
+    if (parsed.words.length || parsed.stdin) fail(`--${parsed.action} does not take question text`);
+    if (parsed.action === "wait") return waitForAnswer(ctx);
+    if (parsed.action === "cancel") return cancel(ctx);
+    return startOver(ctx);
+  }
+  const question = parsed.stdin ? fs.readFileSync(0, "utf8") : parsed.words.join(" ");
+  if (!question.trim()) fail(`no question text\n\n${USAGE}`);
+  return ask(ctx, parsed.mode, question);
+}
+
+main(process.argv.slice(2)).then(
+  (code) => {
+    process.exitCode = code ?? 0;
+  },
+  (error) => {
+    if (error instanceof AskError) {
+      process.stderr.write(`resource-agent: ${error.message}\n`);
+      process.exitCode = error.code;
+    } else {
+      process.stderr.write(`resource-agent: ${error.stack ?? error}\n`);
+      process.exitCode = 1;
+    }
+  },
+);
