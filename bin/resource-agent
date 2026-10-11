@@ -34,9 +34,11 @@ const USAGE = `Usage:
 
 Modes: plan — the agent only reads (default); build — it may edit files in its repository.
 Exit codes: 0 — answer received; 75 — the agent is still working, collect the answer with --wait;
-  76 — the conversation is busy with a previous question; 2 — invalid invocation or config; 3, 5, 130 — acpx codes.
+  76 — the conversation is busy with a previous question; 2 — invalid invocation or config; 3, 5, 130 — acpx codes;
+  69 — the agent server is full; 255 — ssh could not reach the agent server.
 Environment: RESOURCE_AGENT_CHAT, RESOURCE_AGENT_SESSION — whose conversation this is;
-  RESOURCE_AGENT_WAIT, RESOURCE_AGENT_TIMEOUT, RESOURCE_AGENT_TTL — times, s; ACPX_BIN, OPENCODE_BIN — program paths.
+  RESOURCE_AGENT_WAIT, RESOURCE_AGENT_TIMEOUT, RESOURCE_AGENT_TTL — times, s;
+  ACPX_BIN, OPENCODE_BIN, SSH_BIN — program paths.
 `;
 
 // The nearest folder with a resources config, starting from start. The script lives in the package, while the config
@@ -73,7 +75,24 @@ const PREP_TIMEOUT = 120;
 // Output limit for service commands, bytes. acpx sessions show prints the conversation record with the whole
 // message history, and after a few dozen questions it outgrows 1 MB, the spawnSync default.
 const MAX_OUTPUT = 256 * 1024 * 1024;
-const EXIT = { USAGE: 2, PENDING: 75, BUSY: 76 };
+const EXIT = { USAGE: 2, SERVER_FULL: 69, PENDING: 75, BUSY: 76 };
+
+// How to answer, sent with the first question of every conversation. Without it the resource agent takes
+// the asker for its usual user, a developer of the resource, and answers with internals the asker cannot use.
+// Keeping it here rather than in the asking agent's skill means it reaches the resource agent even when
+// the asker forgets it, and a subagent does not need to know whether the conversation already got it.
+const ANSWER_RULES = `You are answering another agent, not a developer of this resource. It works on a different project,
+cannot see this resource and will not look into it. It relies on your answer to make decisions.
+
+- Make the answer clear without access to this resource: what can be done and how it behaves.
+  Mention code, function names or file paths only when asked.
+- Lead with the conclusion, then the details. Keep it short unless asked otherwise.
+- If something is an assumption rather than something you checked, say so.
+- If the question is unclear and the answer depends on how you read it, ask first
+  instead of starting a long search.
+- If you do not know, or the question is outside this resource, say so,
+  and name who to ask if you know.
+- Do not change anything or take actions in external systems unless explicitly asked.`;
 
 // Variables that must not reach the resource agent: they are settings of the asking project and its OpenCode,
 // and would hijack the conversation, disable the resource's plugins or weaken its permissions.
@@ -274,8 +293,10 @@ function findResource(config, key) {
 //                the agent's environment (env), the address for the source line (where),
 //                details about the code checkout (details) and the agent version check (checkAgent).
 // Asking, waiting, cancelling and resetting a conversation are shared by all acpx-based transports.
-// A future transport, such as ssh to an agent server, goes here: permissions there are set by a profile
-// on the server, so it does not need location.permission.
+// A transport that does not run acpx itself defines instead of locate:
+//   send     — performs an action (ask, wait, cancel, new) and returns the exit code;
+//   check    — a line for status: whether the resource is reachable;
+//   describe — lines for profile.
 const TRANSPORTS = {
   local: {
     build: true,
@@ -315,6 +336,57 @@ const TRANSPORTS = {
       };
     },
   },
+  // The agent runs on an agent server, next to the repository. This side only sends a command of the
+  // resource-agent/1 protocol over SSH; the server's resource-agent asks its agent, and the server sets
+  // the model and permissions. Answers, messages and the exit code come back as is.
+  ssh: {
+    build: false,
+    validate(location, where) {
+      const errors = [];
+      if (typeof location.host !== "string" || !SSH_HOST.test(location.host)) {
+        errors.push(`${where}.host: expected a host name or address of the agent server`);
+      }
+      if (location.port !== undefined && !(Number.isInteger(location.port) && location.port > 0 && location.port < 65536)) {
+        errors.push(`${where}.port: expected a port number`);
+      }
+      if (location.user !== undefined && (typeof location.user !== "string" || !SSH_USER.test(location.user))) {
+        errors.push(`${where}.user: expected a user name`);
+      }
+      const unused = {
+        path: "the repository is on the agent server",
+        model: "the agent server sets the model",
+        permission: "the agent server sets the permissions",
+      };
+      for (const [key, why] of Object.entries(unused)) {
+        if (location[key] !== undefined) errors.push(`${where}.${key}: not used by ssh, ${why}; remove it (null in ${path.basename(LOCAL_FILE)})`);
+      }
+      const unknown = Object.keys(location).filter((key) => !["type", "host", "port", "user", ...Object.keys(unused)].includes(key));
+      if (unknown.length) errors.push(`${where}: unknown fields ${unknown.join(", ")}`);
+      return errors;
+    },
+    send: sshSend,
+    check(resource) {
+      const result = spawnSync(sshBin(), sshArgs(resource.location, `${SSH_PROTOCOL} status`), {
+        env: sshEnv(),
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 60_000,
+      });
+      if (result.error) return { ok: false, text: sshSpawnError(result.error) };
+      const reply = `${result.stdout ?? ""}\n${result.stderr ?? ""}`.trim().split("\n")[0] || `code ${result.status}`;
+      return { ok: result.status === 0, text: `${sshAddress(resource.location)} · ${reply}` };
+    },
+    describe(resource) {
+      const chat = chatId();
+      const command = `${SSH_PROTOCOL} ask ${chat === "shared" ? "<chat>" : chat}`;
+      return [
+        `Server: ${sshAddress(resource.location)}`,
+        `Chat: ${chat === "shared" ? "not set — set RESOURCE_AGENT_SESSION=<name>" : chat}`,
+        "Model and permissions: set by the agent server",
+        `ssh call: ${[sshBin(), ...sshArgs(resource.location, command)].map(shellQuote).join(" ")}`,
+      ];
+    },
+  },
 };
 
 // The resource agent's profile for OpenCode 1.x. It is passed through OPENCODE_CONFIG_CONTENT: OpenCode applies it
@@ -349,6 +421,69 @@ function askRules(rules, prefix = "") {
     else if (isObject(value)) found.push(...askRules(value, name));
   }
   return found;
+}
+
+// ---------------------------------------------------------------- ssh
+
+// The command sent to the agent server: "resource-agent/1 <action> <chat>" or "resource-agent/1 status".
+// The question goes to stdin. The server does not take a resource name: one server port is one repository.
+const SSH_PROTOCOL = "resource-agent/1";
+const SSH_DEFAULT_USER = "agent";
+// A host or user starting with "-" would be read by ssh as an option (-oProxyCommand=… runs a command).
+const SSH_HOST = /^[A-Za-z0-9_.:][A-Za-z0-9_.:-]*$/;
+const SSH_USER = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/;
+
+const sshBin = () => process.env.SSH_BIN || "ssh";
+const sshEnv = () => agentEnv({ env: {} });
+
+function sshAddress(location) {
+  return `${location.user ?? SSH_DEFAULT_USER}@${location.host}${location.port ? `:${location.port}` : ""}`;
+}
+
+// BatchMode: a password or host key prompt has nobody to answer it, so fail instead of hanging.
+// ServerAliveInterval: a dropped connection is noticed within a couple of minutes even while the server
+// is silent waiting for the agent.
+function sshArgs(location, command) {
+  const args = ["-T", "-o", "BatchMode=yes", "-o", "RequestTTY=no", "-o", "ServerAliveInterval=30", "-o", "ConnectTimeout=30"];
+  if (location.port) args.push("-p", String(location.port));
+  return [...args, "-l", location.user ?? SSH_DEFAULT_USER, "--", location.host, command];
+}
+
+function sshSpawnError(error) {
+  return error.code === "ENOENT" ? `${sshBin()} not found: install an OpenSSH client or set its path in SSH_BIN` : `could not start ssh: ${error.message}`;
+}
+
+// On a shared server, calls without a chat id from different people would all land in one conversation,
+// so an ssh resource has no shared conversation "shared".
+async function sshSend(resource, action, question) {
+  const chat = chatId();
+  if (chat === "shared") {
+    fail(`${resource.name}: an ssh resource needs a chat id of its own — run from OpenCode with the plugin or set RESOURCE_AGENT_SESSION=<name> (not "shared")`);
+  }
+  const child = spawn(sshBin(), sshArgs(resource.location, `${SSH_PROTOCOL} ${action} ${chat}`), {
+    env: sshEnv(),
+    stdio: [question === undefined ? "ignore" : "pipe", "inherit", "inherit"],
+  });
+  // If the caller stops resource-agent, ssh must stop too; the question itself keeps going on the server.
+  // ssh exits with 255 on a signal, the same code as an unreachable server, so remember that it was stopped.
+  let stopped = false;
+  const forward = (signal) => {
+    stopped = true;
+    child.kill(signal);
+  };
+  const signals = ["SIGINT", "SIGTERM", "SIGHUP"];
+  for (const signal of signals) process.on(signal, forward);
+  child.stdin?.on("error", () => {}); // the server may close stdin early, for example on a refused command
+  child.stdin?.end(question);
+  const { code, error } = await new Promise((resolve) => {
+    child.on("error", (error) => resolve({ error }));
+    child.on("close", (code, signal) => resolve({ code: code ?? (signal ? 130 : 1) }));
+  });
+  for (const signal of signals) process.off(signal, forward);
+  if (error) fail(sshSpawnError(error), 1);
+  if (stopped) return 130;
+  if (code === 255) warn(`${resource.name}: ssh could not reach the agent server ${sshAddress(resource.location)} (code 255)`);
+  return code;
 }
 
 // ---------------------------------------------------------------- programs and environment
@@ -443,7 +578,8 @@ function agentEnv(target) {
 
 // A conversation with a resource is bound to the OpenCode chat that asks: a new chat means a new conversation,
 // and continuing a chat continues the conversation even if the agent process ended long ago. Outside OpenCode
-// all calls go to the shared conversation "shared", and RESOURCE_AGENT_SESSION sets the conversation name explicitly.
+// all calls to local resources go to the shared conversation "shared" (ssh resources refuse, see sshSend),
+// and RESOURCE_AGENT_SESSION sets the conversation name explicitly.
 let chat;
 function chatId() {
   chat ??= detectChat();
@@ -457,7 +593,7 @@ function detectChat() {
   const id = process.env.OPENCODE_SESSION_ID;
   if (id) return clean(topSession(id));
   if (process.env.OPENCODE) {
-    warn("OpenCode did not pass a chat id (is the opencode-resource-agent plugin enabled?); the question goes to the shared conversation");
+    warn("OpenCode did not pass a chat id (is the opencode-resource-agent plugin enabled?); local resources use the shared conversation");
   }
   return "shared";
 }
@@ -537,13 +673,21 @@ function parseJsonOutput(text) {
   }
 }
 
+// When the agent command exits before the conversation starts, acpx exits with its own code, and the agent's
+// code is only in the message. It is passed on: an agent server that is full refuses with 69 (EXIT.SERVER_FULL),
+// and the caller should be able to tell that from other errors.
+function agentStartupCode(text) {
+  const code = Number(/agent exited before initialize completed \(exit=(\d+)/.exec(text ?? "")?.[1]);
+  return code > 0 ? code : undefined;
+}
+
 // A preparation step: creating a conversation, changing the mode or model. An error aborts the question.
 function acpxStep(target, args) {
   const result = runAcpx(target, ["--format", "json", "--timeout", String(PREP_TIMEOUT), ...args]);
   const reply = parseJsonOutput(result.stdout);
   if (result.status !== 0) {
     const message = reply?.error?.message ?? (result.stderr || result.stdout || "").trim();
-    fail(`${describeAcpx(args)}: ${message || `code ${result.status}`}`, result.status || 1);
+    fail(`${describeAcpx(args)}: ${message || `code ${result.status}`}`, agentStartupCode(message) ?? (result.status || 1));
   }
   return reply;
 }
@@ -619,6 +763,8 @@ function stopOwner(recordId) {
 
 // Conversation state lives in .opencode/.state/<conversation>/:
 //   profile.sha — fingerprint of the permissions the agent was started with;
+//   rules.pending — left by --new: the conversation was started over without a question, so the next
+//                 question carries ANSWER_RULES even though it does not create the conversation;
 //   job/        — the question in progress. The folder is created atomically (mkdir fails if it exists),
 //                 and that is the "conversation busy" mark: two simultaneous calls will not send two questions.
 //     meta.json   — resource, mode, model and the pid of the process currently responsible for the question;
@@ -626,6 +772,7 @@ function stopOwner(recordId) {
 //     result.json — appears when the question is finished.
 const conversationDir = (conversation) => path.join(STATE_DIR, conversation.replace(/[^A-Za-z0-9_.-]/g, "_"));
 const jobDir = (conversation) => path.join(conversationDir(conversation), "job");
+const rulesPendingFile = (conversation) => path.join(conversationDir(conversation), "rules.pending");
 const clearJob = (conversation) => fs.rmSync(jobDir(conversation), { recursive: true, force: true });
 
 function readJob(conversation) {
@@ -681,10 +828,12 @@ async function ask(ctx, mode, question) {
   const dir = jobDir(conversation);
   try {
     const { created, model } = prepare(ctx, mode);
-    fs.writeFileSync(path.join(dir, "question.txt"), question);
+    const withRules = created || fs.existsSync(rulesPendingFile(conversation));
+    fs.writeFileSync(path.join(dir, "question.txt"), withRules ? `${ANSWER_RULES}\n\nQuestion:\n${question}` : question);
     const meta = { resource: ctx.resource.name, mode, model, created, startedAt: new Date().toISOString() };
     const pid = startJob(ctx, dir);
     writeJson(path.join(dir, "meta.json"), { ...meta, pid });
+    fs.rmSync(rulesPendingFile(conversation), { force: true });
   } catch (error) {
     clearJob(conversation);
     throw error;
@@ -757,7 +906,7 @@ function deliver(ctx, job) {
     .filter((line) => line.trim() && !line.startsWith("[acpx] tokens:"))
     .join("\n");
   clearJob(ctx.conversation);
-  const code = job.result.code;
+  const code = job.result.code === 0 ? 0 : (agentStartupCode(errors) ?? job.result.code);
   out(sourceLine(ctx, job.meta));
   if (answer) out(answer);
   if (code !== 0) {
@@ -777,6 +926,8 @@ function explainExit(code, options) {
       return "the agent tried to do something its mode's permissions forbid; the answer may be incomplete";
     case 130:
       return "the question was interrupted";
+    case EXIT.SERVER_FULL:
+      return "the agent did not start: the agent server is full, ask again later";
     default:
       return `acpx exited with code ${code}`;
   }
@@ -812,6 +963,7 @@ function startOver(ctx) {
   if (!claimConversation(ctx)) return busy(ctx, readJob(ctx.conversation));
   try {
     const { model } = prepare(ctx, "plan", { fresh: true });
+    fs.writeFileSync(rulesPendingFile(ctx.conversation), "");
     out(sourceLine(ctx, { mode: "plan", model, created: true }));
   } finally {
     clearJob(ctx.conversation);
@@ -868,9 +1020,15 @@ function status() {
   for (const [name, entry] of Object.entries(config.resources)) {
     const resource = { name, ...entry };
     const aliases = entry.aliases?.length ? ` (${entry.aliases.join(", ")})` : "";
+    const transport = TRANSPORTS[entry.location.type];
+    if (transport.check) {
+      const { ok, text } = transport.check(resource);
+      check(ok, `${name}${aliases} · ${entry.location.type} · ${text}`);
+      continue;
+    }
     const model = entry.location.model ? `model ${entry.location.model}` : "no model set — set location.model in the personal file";
     try {
-      const target = TRANSPORTS[entry.location.type].locate(resource);
+      const target = transport.locate(resource);
       check(Boolean(entry.location.model), `${name}${aliases} · ${entry.location.type} · ${target.where} · ${target.details()} · ${model}`);
       const job = readJob(conversationName(resource));
       if (job) out(`      question in progress: ${{ running: "the agent is answering", done: "answer ready, collect it with --wait", lost: "broke off" }[job.state]}`);
@@ -879,7 +1037,8 @@ function status() {
       check(false, `${name}${aliases} · ${error.message}`);
     }
   }
-  out(`Chat: ${chatId()}`);
+  const hasSsh = Object.values(config.resources).some((entry) => entry.location.type === "ssh");
+  out(`Chat: ${chatId()}${chatId() === "shared" && hasSsh ? " — ssh resources need RESOURCE_AGENT_SESSION=<name>" : ""}`);
   return healthy ? 0 : 1;
 }
 
@@ -906,7 +1065,13 @@ function profile(config, args) {
   const { words, mode } = parseArgs(args);
   if (words.length !== 1) fail("usage: resource-agent profile <resource> [--mode plan|build]");
   const resource = findResource(config, words[0]);
-  const target = TRANSPORTS[resource.location.type].locate(resource);
+  const transport = TRANSPORTS[resource.location.type];
+  if (mode === "build" && !transport.build) fail(`${resource.name}: transport ${resource.location.type} does not support build mode`);
+  if (transport.describe) {
+    for (const line of transport.describe(resource)) out(line);
+    return 0;
+  }
+  const target = transport.locate(resource);
   out(`Conversation: ${conversationName(resource)}`);
   out(`Folder: ${target.cwd}`);
   out(`Agent command: ${target.agentCommand}`);
@@ -1129,17 +1294,20 @@ async function main(args) {
   const parsed = parseArgs(rest);
   const transport = TRANSPORTS[resource.location.type];
   if (parsed.mode === "build" && !transport.build) fail(`${resource.name}: transport ${resource.location.type} does not support build mode`);
-  const target = transport.locate(resource);
-  const ctx = { resource, target, conversation: conversationName(resource), options: config.options };
-
+  let question;
   if (parsed.action !== "ask") {
     if (parsed.words.length || parsed.stdin) fail(`--${parsed.action} does not take question text`);
-    if (parsed.action === "wait") return waitForAnswer(ctx);
-    if (parsed.action === "cancel") return cancel(ctx);
-    return startOver(ctx);
+  } else {
+    question = parsed.stdin ? fs.readFileSync(0, "utf8") : parsed.words.join(" ");
+    if (!question.trim()) fail(`no question text\n\n${USAGE}`);
   }
-  const question = parsed.stdin ? fs.readFileSync(0, "utf8") : parsed.words.join(" ");
-  if (!question.trim()) fail(`no question text\n\n${USAGE}`);
+  if (transport.send) return transport.send(resource, parsed.action, question);
+
+  const target = transport.locate(resource);
+  const ctx = { resource, target, conversation: conversationName(resource), options: config.options };
+  if (parsed.action === "wait") return waitForAnswer(ctx);
+  if (parsed.action === "cancel") return cancel(ctx);
+  if (parsed.action === "new") return startOver(ctx);
   return ask(ctx, parsed.mode, question);
 }
 

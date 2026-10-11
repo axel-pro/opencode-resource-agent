@@ -88,6 +88,67 @@ own providers) and personal paths to the repositories. `resource-agent init` cre
 If no model is set, the resource's OpenCode silently uses its default model, which may be an external service.
 `resource-agent` warns about it.
 
+### A resource on an agent server (`ssh`)
+
+The `local` transport needs a checkout of the resource and runs its agent on your machine. The `ssh` transport sends
+the question to an agent server instead: there the resource's agent runs next to its repository, and the server
+sets the model, the provider and the permissions. Your machine needs only an OpenSSH client and a key the server
+accepts.
+
+```jsonc
+"backend": {
+  "description": "…", "aliases": ["back"], "tags": ["…"],
+  "location": {
+    "type": "ssh",
+    "host": "agents.internal", // host name, address or a Host from ~/.ssh/config
+    "port": 2222,              // optional; one server port is one repository
+    "user": "agent"            // optional, agent by default
+  }
+}
+```
+
+- `path`, `model` and `permission` are not allowed: the repository, the model and the permissions are on the server.
+  If the personal file still sets them for this resource, remove them there with `null`.
+- Only `plan` mode: the server's agent does not edit its repository.
+- `options` (`wait`, `timeout`, `ttl`) and the `RESOURCE_AGENT_WAIT`, `RESOURCE_AGENT_TIMEOUT`, `RESOURCE_AGENT_TTL`
+  variables do not apply: the agent server sets its own limits, and ssh does not pass environment variables to it.
+  A long question still ends with code 75 and is collected with `--wait`, but how long a call waits is up to
+  the server.
+- ssh runs with `BatchMode=yes`: a password or an unknown host key is an error, not a prompt. See
+  "First connection to an agent server" below.
+- A question, `--wait`, `--cancel` and `--new` are commands of the `resource-agent/1` protocol: `ssh … resource-agent/1
+  ask <chat>` with the question on stdin. The server keeps the conversations, so `--wait` works from any machine
+  with the same chat id.
+- There is no shared conversation: on a shared server, calls without a chat id from different people would land in
+  one conversation. Outside OpenCode set `RESOURCE_AGENT_SESSION=<name>`; without it the call is refused with code 2.
+
+#### First connection to an agent server
+
+Two things have to be in place before the first question, and both are one-time steps of a person, not of the agent:
+
+1. **The server lets you in.** Send your public key (`~/.ssh/id_ed25519.pub` or the key from your `~/.ssh/config`)
+   to whoever runs the agent server; they add it to the instance's `authorized_keys`. Until then `status` shows
+   `Permission denied (publickey)`.
+2. **You trust the server.** ssh checks the server's host key against `~/.ssh/known_hosts`, and with `BatchMode`
+   it cannot ask "Are you sure you want to continue connecting?". An unknown server is refused with
+   `Host key verification failed.` (exit code 255). Add its key once:
+
+   ```bash
+   ssh-keyscan -p 2222 agents.internal 2>/dev/null | ssh-keygen -lf -     # look at the fingerprint first
+   ssh-keyscan -p 2222 agents.internal 2>/dev/null >> ~/.ssh/known_hosts  # then trust it
+   ```
+
+   `ssh-keyscan` takes the key the server presents without checking it, so compare the fingerprint with the one
+   the server's owner gives you (on the server: `ssh-keygen -lf <instance>/hostkeys/ssh_host_ed25519_key.pub`).
+   For a port other than 22 the entry is written as `[agents.internal]:2222`. Use the same host name as in
+   `location.host`: `localhost` and `127.0.0.1` are different entries for ssh.
+
+If the server is recreated with a new host key, ssh refuses with `REMOTE HOST IDENTIFICATION HAS CHANGED`. Make
+sure the change is expected, remove the old entry with `ssh-keygen -R '[agents.internal]:2222'` and add the new one
+as above.
+
+`resource-agent status` checks both: an ssh resource gets ✓ and the server's reply, or ✗ and the line ssh printed.
+
 The config lives in `.opencode/`, but it does not depend on OpenCode as a client: `resource-agent` reads it both
 when run from a terminal and from another agent. The script looks for the nearest folder with
 `.opencode/resources.jsonc`, starting from the current one, so it works from any subfolder of the project.
@@ -111,8 +172,13 @@ npx resource-agent profile backend     # what the resource agent gets: command, 
 ```
 
 From a terminal all calls go to the shared conversation `shared`; `RESOURCE_AGENT_SESSION=<name>` sets
-a different conversation name. Inside OpenCode the plugin binds the conversation to the chat, also for
-`resource-agent` run from the shell.
+a different conversation name; `ssh` resources have no shared conversation and need it. Inside OpenCode the plugin
+binds the conversation to the chat, also for `resource-agent` run from the shell.
+
+The first question of a conversation (a new one or one started over with `--new`) is preceded by rules for
+the resource agent: it is answering another agent that cannot see the resource, so the answer should make sense
+without internals, lead with the conclusion and mark assumptions. The rules are `ANSWER_RULES` in
+`bin/resource-agent`.
 
 The first line of an answer is its source: resource, transport, mode, path, branch and model, for example
 `[backend · local · plan · /…/product/back · main · model provider/model]`.
@@ -126,11 +192,11 @@ sent: the script exits with code 76 and suggests `--wait` or `--cancel`.
 
 Exit codes: `0` — answer received; `75` — the agent is still working; `76` — the conversation is busy with
 a previous question; `2` — invalid invocation or config; `3`, `5`, `130` — acpx codes (timeout, permission denial,
-interruption).
+interruption); `69` — the agent server is full (`ssh`); `255` — ssh could not reach the agent server.
 
 Environment variables: `RESOURCE_AGENT_CHAT`, `RESOURCE_AGENT_SESSION` — whose conversation this is;
-`RESOURCE_AGENT_WAIT`, `RESOURCE_AGENT_TIMEOUT`, `RESOURCE_AGENT_TTL` — override `options`, in seconds;
-`ACPX_BIN`, `OPENCODE_BIN` — program paths.
+`RESOURCE_AGENT_WAIT`, `RESOURCE_AGENT_TIMEOUT`, `RESOURCE_AGENT_TTL` — override `options`, in seconds (`local` only);
+`ACPX_BIN`, `OPENCODE_BIN`, `SSH_BIN` — program paths.
 
 ## Modes and permissions
 
@@ -181,9 +247,9 @@ settings and, for a resource, returns:
 - the agent's environment variables;
 - the address and checkout details for the source line.
 
-Asking, waiting, cancelling and resetting a conversation are shared by all acpx-based transports. A natural next
-candidate is SSH to an agent server: the agent command is `ssh -T <host>`, and permissions are set by a profile
-on the server, so `location.permission` is not needed there.
+Asking, waiting, cancelling and resetting a conversation are shared by all acpx-based transports. A transport
+that does not run acpx on this machine, like `ssh`, defines instead `send` (performs an action and returns
+the exit code), `check` (a line for `status`) and `describe` (lines for `profile`).
 
 ## State and disk space
 
@@ -213,8 +279,8 @@ npm install
 npm test
 ```
 
-Tests run the CLI in temporary projects against fake `acpx` and `opencode` (`test/fake-acpx`,
-`test/fake-opencode`), so no agent or model is needed.
+Tests run the CLI in temporary projects against fake `acpx`, `opencode` and `ssh` (`test/fake-acpx`,
+`test/fake-opencode`, `test/fake-ssh`), so no agent, model or agent server is needed.
 
 To try a local checkout in OpenCode, point the plugin at the directory:
 

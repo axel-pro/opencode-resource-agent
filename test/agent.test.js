@@ -13,6 +13,7 @@ const test = require("node:test");
 const SCRIPT = path.join(__dirname, "..", "bin", "resource-agent");
 const FAKE_ACPX = path.join(__dirname, "fake-acpx");
 const FAKE_OPENCODE = path.join(__dirname, "fake-opencode");
+const FAKE_SSH = path.join(__dirname, "fake-ssh");
 
 // The "Émile" alias checks that aliases are matched case-insensitively beyond ASCII.
 const SHARED = `{
@@ -50,7 +51,9 @@ function makeProject({ shared = SHARED, local } = {}) {
     HOME: home,
     ACPX_BIN: FAKE_ACPX,
     OPENCODE_BIN: FAKE_OPENCODE,
+    SSH_BIN: FAKE_SSH,
     FAKE_ACPX_DIR: fake,
+    FAKE_SSH_DIR: fake,
     ...extra,
   });
   const argv = (args) => [SCRIPT, ...args];
@@ -78,6 +81,16 @@ function makeProject({ shared = SHARED, local } = {}) {
       const file = path.join(fake, "calls.jsonl");
       if (!fs.existsSync(file)) return [];
       return fs.readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    },
+    sshCalls() {
+      const file = path.join(fake, "ssh.jsonl");
+      if (!fs.existsSync(file)) return [];
+      return fs.readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    },
+    prompts() {
+      const file = path.join(fake, "prompts.jsonl");
+      if (!fs.existsSync(file)) return [];
+      return fs.readFileSync(file, "utf8").trim().split("\n").map((line) => JSON.parse(line).prompt);
     },
     record(name) {
       return JSON.parse(fs.readFileSync(path.join(fake, "records", `${name.replace(/[^A-Za-z0-9_.-]/g, "_")}.json`), "utf8"));
@@ -157,7 +170,7 @@ test("the project is the nearest folder above with a resources config", (t) => {
 test("config: clear errors", (t) => {
   const cases = [
     [SHARED.replace('"version": 1', '"version": 2'), "version"],
-    [SHARED.replace('"type": "local", "path": "../back"', '"type": "ssh", "path": "../back"'), "unknown transport"],
+    [SHARED.replace('"type": "local", "path": "../back"', '"type": "pigeon", "path": "../back"'), "unknown transport"],
     [SHARED.replace('"aliases": ["front"]', '"aliases": ["back"]'), "already taken by resource backend"],
     [SHARED.replace('"tags": ["counter"]', '"tags": "counter"'), "frontend.tags: expected an array"],
     [SHARED.replace('"tags": ["counter"]', '"tags": ["counter", " "]'), "frontend.tags: expected non-empty strings"],
@@ -273,6 +286,25 @@ test("a follow-up question continues the conversation, the mode is set only when
     ["set mode plan", "set mode build"],
   );
   assert.equal(project.record("resource-agent:backend:chat1").acpx.desired_config_options.mode, "build");
+});
+
+test("the answer rules go with the first question of a conversation, also after --new", (t) => {
+  const project = makeProject();
+  t.after(() => project.cleanup());
+  const env = { RESOURCE_AGENT_CHAT: "chat1" };
+  const rules = /^You are answering another agent[\s\S]*\n\nQuestion:\n/;
+
+  for (const question of ["first", "second"]) assert.equal(project.run(["backend", question], { env }).code, 0);
+  assert.equal(project.run(["backend", "--new"], { env }).code, 0);
+  for (const question of ["third", "fourth"]) assert.equal(project.run(["backend", question], { env }).code, 0);
+
+  const prompts = project.prompts();
+  assert.match(prompts[0], rules);
+  assert.match(prompts[0], /\nfirst$/);
+  assert.equal(prompts[1], "second");
+  assert.match(prompts[2], rules);
+  assert.match(prompts[2], /\nthird$/);
+  assert.equal(prompts[3], "fourth");
 });
 
 test("conversations of different chats do not mix; a question from stdin", (t) => {
@@ -425,6 +457,24 @@ test("agent errors: permission denial and OpenCode 2.x", (t) => {
   assert.match(v2.stderr, /targets 1\.x/);
 });
 
+test("an agent that does not start: its exit code is passed on (69 — the agent server is full)", (t) => {
+  const project = makeProject();
+  t.after(() => project.cleanup());
+  const full = { FAKE_ACPX_AGENT_EXIT: "69" };
+
+  const created = project.run(["backend", "question"], { env: { RESOURCE_AGENT_CHAT: "chat1", ...full } });
+  assert.equal(created.code, 69, created.stderr);
+  assert.match(created.stderr, /agent server is full/);
+
+  // an existing conversation whose agent has to be started again for the question
+  assert.equal(project.run(["backend", "first"], { env: { RESOURCE_AGENT_CHAT: "chat2" } }).code, 0);
+  const asked = project.run(["backend", "second"], { env: { RESOURCE_AGENT_CHAT: "chat2", ...full } });
+  assert.equal(asked.code, 69, asked.stderr);
+  assert.match(asked.stderr, /the agent did not start: the agent server is full/);
+  // the conversation is free again
+  assert.equal(project.run(["backend", "third"], { env: { RESOURCE_AGENT_CHAT: "chat2" } }).code, 0);
+});
+
 test("--new starts the conversation over; an unknown resource and an empty question", (t) => {
   const project = makeProject();
   t.after(() => project.cleanup());
@@ -484,4 +534,179 @@ test("init creates the personal file from the template and does not overwrite it
   fs.writeFileSync(local, "{}\n");
   assert.match(project.run(["init"]).stdout, /already exists/);
   assert.equal(fs.readFileSync(local, "utf8"), "{}\n");
+});
+
+// ---------------------------------------------------------------- ssh transport
+
+const SSH_SHARED = `{
+  "version": 1,
+  "resources": {
+    "backend": {
+      "aliases": ["back"],
+      "location": { "type": "ssh", "host": "agents.test", "port": 2222 }
+    },
+    "docs": {
+      "location": { "type": "ssh", "host": "docs.test", "user": "bob" }
+    },
+    "frontend": {
+      "location": { "type": "local", "path": "../front", "model": "fake/model" }
+    }
+  }
+}`;
+
+test("ssh: a question goes to the server as a protocol command, the answer and code come back as is", (t) => {
+  const project = makeProject({ shared: SSH_SHARED });
+  t.after(() => project.cleanup());
+  const env = { RESOURCE_AGENT_CHAT: "chat1", OPENCODE_SESSION_ID: "ses_x" };
+
+  const asked = project.run(["back", "How", "are", "you?"], { env });
+  assert.equal(asked.code, 0, asked.stderr);
+  assert.equal(asked.stdout, "[backend · local · plan · /srv/agent/repo · main · model server/model · new conversation]\nanswer to chat1: How are you?\n");
+  const fromStdin = project.run(["docs", "--mode", "plan", "-"], { env, input: "-a question\nin two lines" });
+  assert.equal(fromStdin.code, 0, fromStdin.stderr);
+
+  const [first, second] = project.sshCalls();
+  assert.deepEqual(first.args, [
+    "-T", "-o", "BatchMode=yes", "-o", "RequestTTY=no", "-o", "ServerAliveInterval=30", "-o", "ConnectTimeout=30",
+    "-p", "2222", "-l", "agent", "--", "agents.test", "resource-agent/1 ask chat1",
+  ]);
+  assert.equal(first.stdin, "How are you?");
+  // the chat id goes in the command, not in the environment
+  assert.deepEqual(first.env, {});
+  assert.equal(second.port, undefined);
+  assert.equal(second.user, "bob");
+  assert.equal(second.host, "docs.test");
+  assert.equal(second.stdin, "-a question\nin two lines");
+  assert.deepEqual(project.calls(), [], "acpx must not be called for an ssh resource");
+
+  for (const [question, code, stream, text] of [
+    ["PENDING", 75, "stdout", /still working/],
+    ["FULL", 69, "stderr", /server is full/],
+  ]) {
+    const result = project.run(["backend", question], { env });
+    assert.equal(result.code, code, result.stderr);
+    assert.match(result[stream], text);
+  }
+});
+
+test("ssh: --wait, --cancel and --new become protocol commands without stdin", (t) => {
+  const project = makeProject({ shared: SSH_SHARED });
+  t.after(() => project.cleanup());
+  for (const action of ["wait", "cancel", "new"]) {
+    const result = project.run(["backend", `--${action}`], { env: { RESOURCE_AGENT_SESSION: "my session" } });
+    assert.equal(result.code, 0, result.stderr);
+    assert.equal(result.stdout, `${action} my_session: ok\n`);
+  }
+  assert.deepEqual(
+    project.sshCalls().map((call) => [call.command, call.stdin]),
+    [["resource-agent/1 wait my_session", ""], ["resource-agent/1 cancel my_session", ""], ["resource-agent/1 new my_session", ""]],
+  );
+});
+
+test("ssh: no shared conversation, no build mode", (t) => {
+  const project = makeProject({ shared: SSH_SHARED });
+  t.after(() => project.cleanup());
+
+  for (const env of [{}, { RESOURCE_AGENT_SESSION: "shared" }]) {
+    const result = project.run(["backend", "question"], { env });
+    assert.equal(result.code, 2, result.stderr);
+    assert.match(result.stderr, /needs a chat id of its own .* RESOURCE_AGENT_SESSION=<name>/);
+  }
+  const build = project.run(["backend", "--mode", "build", "edit"], { env: { RESOURCE_AGENT_CHAT: "chat1" } });
+  assert.equal(build.code, 2);
+  assert.match(build.stderr, /does not support build mode/);
+  assert.deepEqual(project.sshCalls(), []);
+
+  // a local resource in the same project keeps the shared conversation
+  assert.equal(project.run(["frontend", "question"]).code, 0);
+  assert.equal(commandOf(project.calls().at(-1))[2], "resource-agent:frontend:shared");
+});
+
+test("ssh: an unreachable server and a missing ssh", (t) => {
+  const project = makeProject({ shared: SSH_SHARED });
+  t.after(() => project.cleanup());
+  const env = { RESOURCE_AGENT_CHAT: "chat1" };
+
+  const unreachable = project.run(["backend", "question"], { env: { ...env, FAKE_SSH_UNREACHABLE: "1" } });
+  assert.equal(unreachable.code, 255);
+  assert.match(unreachable.stderr, /Connection refused/);
+  assert.match(unreachable.stderr, /could not reach the agent server agent@agents\.test:2222/);
+
+  const missing = project.run(["backend", "question"], { env: { ...env, SSH_BIN: path.join(project.base, "no-ssh") } });
+  assert.equal(missing.code, 1);
+  assert.match(missing.stderr, /not found: install an OpenSSH client or set its path in SSH_BIN/);
+});
+
+test("ssh: stopping resource-agent stops ssh", async (t) => {
+  const project = makeProject({ shared: SSH_SHARED });
+  t.after(() => project.cleanup());
+  const child = spawn(process.execPath, [SCRIPT, "backend", "SLOW"], {
+    cwd: project.project,
+    env: { PATH: process.env.PATH, HOME: project.home, SSH_BIN: FAKE_SSH, FAKE_SSH_DIR: project.fake, RESOURCE_AGENT_CHAT: "chat1" },
+  });
+  const closed = new Promise((resolve) => child.on("close", resolve));
+  const pidFile = path.join(project.fake, "ssh.pid");
+  for (let i = 0; i < 50 && !fs.existsSync(pidFile); i++) await sleep(100);
+  const sshPid = Number(fs.readFileSync(pidFile, "utf8"));
+  t.after(() => {
+    try {
+      process.kill(sshPid, "SIGKILL");
+    } catch {}
+  });
+  let stderr = "";
+  child.stderr.on("data", (chunk) => (stderr += chunk));
+  child.kill("SIGTERM");
+  assert.equal(await closed, 130);
+  assert.doesNotMatch(stderr, /could not reach/);
+  await sleep(200);
+  assert.ok(!isAlive(sshPid), "ssh is still running");
+});
+
+test("ssh: status asks the server, profile shows the ssh call", (t) => {
+  const project = makeProject({ shared: SSH_SHARED, local: "{}" });
+  t.after(() => project.cleanup());
+
+  const status = project.run(["status"]);
+  assert.equal(status.code, 0, status.stdout + status.stderr);
+  assert.match(status.stdout, /✓ backend \(back\) · ssh · agent@agents\.test:2222 · agent server: ok/);
+  assert.match(status.stdout, /Chat: shared — ssh resources need RESOURCE_AGENT_SESSION=<name>/);
+  assert.ok(project.sshCalls().some((call) => call.command === "resource-agent/1 status"));
+
+  const down = project.run(["status"], { env: { FAKE_SSH_UNREACHABLE: "1", RESOURCE_AGENT_CHAT: "chat1" } });
+  assert.equal(down.code, 1);
+  assert.match(down.stdout, /✗ backend \(back\) · ssh · agent@agents\.test:2222 · ssh: connect to host agents\.test port 2222: Connection refused/);
+  assert.match(down.stdout, /Chat: chat1\n/);
+
+  const profile = project.run(["profile", "backend"], { env: { RESOURCE_AGENT_CHAT: "chat1" } });
+  assert.equal(profile.code, 0, profile.stderr);
+  assert.match(profile.stdout, /Server: agent@agents\.test:2222\nChat: chat1\n/);
+  assert.match(profile.stdout, /ssh call: .*fake-ssh -T .* -p 2222 -l agent -- agents\.test 'resource-agent\/1 ask chat1'\n/);
+});
+
+test("ssh: config errors", (t) => {
+  const backend = '"location": { "type": "ssh", "host": "agents.test", "port": 2222 }';
+  const cases = [
+    ['"location": { "type": "ssh", "port": 2222 }', "backend.location.host: expected a host name"],
+    ['"location": { "type": "ssh", "host": "-oProxyCommand=touch /tmp/x" }', "backend.location.host: expected a host name"],
+    ['"location": { "type": "ssh", "host": "agents.test", "port": "2222" }', "backend.location.port: expected a port number"],
+    ['"location": { "type": "ssh", "host": "agents.test", "user": "-l" }', "backend.location.user: expected a user name"],
+    ['"location": { "type": "ssh", "host": "agents.test", "path": "../back" }', "backend.location.path: not used by ssh, the repository is on the agent server"],
+    ['"location": { "type": "ssh", "host": "agents.test", "model": "x/y" }', "backend.location.model: not used by ssh, the agent server sets the model"],
+    ['"location": { "type": "ssh", "host": "agents.test", "permission": {} }', "backend.location.permission: not used by ssh"],
+    ['"location": { "type": "ssh", "host": "agents.test", "hostname": "x" }', "unknown fields hostname"],
+  ];
+  for (const [location, expected] of cases) {
+    const project = makeProject({ shared: SSH_SHARED.replace(backend, location) });
+    t.after(() => project.cleanup());
+    const result = project.run(["backend", "question"], { env: { RESOURCE_AGENT_CHAT: "chat1" } });
+    assert.equal(result.code, 2, `${expected}: ${result.stderr}`);
+    assert.ok(result.stderr.includes(expected), `${expected}: ${result.stderr}`);
+  }
+  // a model left in the personal file from local times is removed with null
+  const project = makeProject({
+    shared: SSH_SHARED,
+    local: '{ "resources": { "backend": { "location": { "model": null } }, "docs": { "location": { "model": "x/y" } } } }',
+  });
+  t.after(() => project.cleanup());
+  assert.match(project.run(["backend", "q"]).stderr, /docs\.location\.model: not used by ssh.*null in resources\.local\.jsonc/);
 });

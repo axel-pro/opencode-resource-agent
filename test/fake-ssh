@@ -1,0 +1,58 @@
+#!/usr/bin/env node
+// Fake ssh for the resource-agent tests: plays the agent server of the resource-agent/1 protocol without a network.
+// Every call (arguments, the remote command, stdin and relevant environment variables) is appended to
+// $FAKE_SSH_DIR/ssh.jsonl.
+// $FAKE_SSH_UNREACHABLE makes it fail like an unreachable host (code 255). A question containing PENDING exits
+// with 75, FULL with 69 (the server is full), SLOW writes the process pid to $FAKE_SSH_DIR/ssh.pid and hangs
+// until a signal, which ends it with 255, as in OpenSSH.
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+
+const dir = process.env.FAKE_SSH_DIR;
+const args = process.argv.slice(2);
+const end = args.indexOf("--");
+const [host, command] = args.slice(end + 1);
+const option = (name) => {
+  const at = args.indexOf(name);
+  return at === -1 || at > end ? undefined : args[at + 1];
+};
+const stdin = fs.readFileSync(0, "utf8");
+const logged = ["RESOURCE_AGENT_CHAT", "RESOURCE_AGENT_SESSION", "OPENCODE_SESSION_ID"];
+fs.mkdirSync(dir, { recursive: true });
+fs.appendFileSync(
+  path.join(dir, "ssh.jsonl"),
+  `${JSON.stringify({ args, host, port: option("-p"), user: option("-l"), command, stdin, env: Object.fromEntries(logged.map((name) => [name, process.env[name]])) })}\n`,
+);
+
+if (process.env.FAKE_SSH_UNREACHABLE) {
+  process.stderr.write(`ssh: connect to host ${host} port ${option("-p") ?? 22}: Connection refused\n`);
+  process.exit(255);
+}
+const [protocol, action, chat] = command.split(" ");
+if (protocol !== "resource-agent/1") {
+  process.stderr.write("unknown protocol\n");
+  process.exit(2);
+}
+if (action === "status") {
+  console.log("agent server: ok");
+} else if (action === "ask") {
+  if (stdin.includes("SLOW")) {
+    // like OpenSSH: a signal ends ssh with code 255
+    for (const signal of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(signal, () => process.exit(255));
+    fs.writeFileSync(path.join(dir, "ssh.pid"), String(process.pid));
+    setInterval(() => {}, 1000);
+  } else if (stdin.includes("FULL")) {
+    process.stderr.write("the agent server is full, try later\n");
+    process.exit(69);
+  } else if (stdin.includes("PENDING")) {
+    console.log("backend: the agent is still working on the question");
+    process.exit(75);
+  } else {
+    console.log("[backend · local · plan · /srv/agent/repo · main · model server/model · new conversation]");
+    console.log(`answer to ${chat}: ${stdin}`);
+  }
+} else {
+  console.log(`${action} ${chat}: ok`);
+}

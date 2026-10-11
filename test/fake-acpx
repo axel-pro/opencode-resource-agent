@@ -4,6 +4,10 @@
 // conversation records are kept in $FAKE_ACPX_DIR/records/.
 // A question containing SLOW is answered after $FAKE_ACPX_SLOW_MS ms (2000 by default) unless the cancel
 // command comes first; a question containing DENIED exits with code 5, like a permission denial.
+// The text of every question is appended to $FAKE_ACPX_DIR/prompts.jsonl. The answer repeats the question
+// without the answer rules resource-agent puts before the first question of a conversation.
+// $FAKE_ACPX_AGENT_EXIT makes the agent command fail to start with that code (69: a full agent server) when
+// a conversation is created or a question is asked, the way acpx reports it: its own code 1, the agent's in the text.
 // $FAKE_ACPX_HISTORY_BYTES adds a message history of that size to the sessions show output,
 // like the real acpx, which prints the whole conversation record.
 "use strict";
@@ -53,6 +57,17 @@ const noSession = (name) => {
   process.exit(4);
 };
 
+const agentExit = process.env.FAKE_ACPX_AGENT_EXIT;
+const startupFailure = `ACP agent exited before initialize completed (exit=${agentExit}, signal=null): the agent server is full`;
+if (agentExit && command === "sessions" && ["ensure", "new"].includes(rest[0])) {
+  console.log(JSON.stringify({ error: { message: startupFailure } }));
+  process.exit(1);
+}
+if (agentExit && command === "prompt") {
+  process.stderr.write(`[acpx] error: RUNTIME AGENT_STARTUP_FAILED ${startupFailure}\n`);
+  process.exit(1);
+}
+
 if (command === "sessions") {
   const [sub, maybeName] = rest;
   if (sub === "show") {
@@ -93,7 +108,10 @@ if (command === "sessions") {
 } else if (command === "prompt") {
   const name = flag("-s");
   if (!readRecord(name)) noSession(name);
-  const question = fs.readFileSync(flag("-f"), "utf8");
+  const prompt = fs.readFileSync(flag("-f"), "utf8");
+  fs.appendFileSync(path.join(dir, "prompts.jsonl"), `${JSON.stringify({ session: name, prompt })}\n`);
+  const marker = "\nQuestion:\n";
+  const question = prompt.includes(marker) ? prompt.slice(prompt.indexOf(marker) + marker.length) : prompt;
   const finish = () => {
     if (question.includes("DENIED")) {
       process.stderr.write("[acpx] error: permission denied\n");

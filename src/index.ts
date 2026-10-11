@@ -87,7 +87,9 @@ export const ResourceAgent = async ({ client, directory }) => {
   const catalog = resources.length
     ? resources
         .map((r) => {
-          const line = `- ${r.name}${r.aliases.length ? ` (${r.aliases.join(", ")})` : ""}: ${r.description || "no description"}`
+          // A transport without build mode (ssh) is marked so the agent does not ask such a resource for edits.
+          const readOnly = r.build === false ? " (read-only: no build mode)" : ""
+          const line = `- ${r.name}${r.aliases.length ? ` (${r.aliases.join(", ")})` : ""}: ${r.description || "no description"}${readOnly}`
           return r.tags?.length ? `${line}\n  Topics: ${r.tags.join(", ")}` : line
         })
         .join("\n")
