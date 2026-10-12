@@ -202,8 +202,10 @@ test("question: acpx flags, permission profile and a cleaned environment", (t) =
   const calls = project.calls();
   assert.deepEqual(
     calls.map((call) => commandOf(call).slice(0, 2).join(" ")),
-    ["sessions show", "sessions ensure", "sessions show", "set mode", "prompt -s"],
+    ["sessions show", "sessions ensure", "sessions show", "set mode", "set effort", "prompt -s"],
   );
+  // without location.effort the level is "default", not the one the new conversation started with
+  assert.deepEqual(commandOf(calls[4]).slice(0, 3), ["set", "effort", "default"]);
   for (const call of calls) {
     assert.equal(valueOf(call, "--cwd"), project.back);
     assert.equal(valueOf(call, "--agent"), `${FAKE_OPENCODE} acp`);
@@ -214,7 +216,7 @@ test("question: acpx flags, permission profile and a cleaned environment", (t) =
     assert.equal(call.env.OPENCODE_DISABLE_AUTOUPDATE, "1");
   }
   // the model is passed only when the conversation is created
-  assert.deepEqual(calls.map((call) => valueOf(call, "--model")), [undefined, "fake/model", undefined, undefined, undefined]);
+  assert.deepEqual(calls.map((call) => valueOf(call, "--model")), [undefined, "fake/model", undefined, undefined, undefined, undefined]);
 
   const prompt = calls.at(-1);
   assert.deepEqual(commandOf(prompt).slice(0, 3), ["prompt", "-s", "resource-agent:backend:chat1"]);
@@ -692,6 +694,7 @@ test("ssh: config errors", (t) => {
     ['"location": { "type": "ssh", "host": "agents.test", "user": "-l" }', "backend.location.user: expected a user name"],
     ['"location": { "type": "ssh", "host": "agents.test", "path": "../back" }', "backend.location.path: not used by ssh, the repository is on the agent server"],
     ['"location": { "type": "ssh", "host": "agents.test", "model": "x/y" }', "backend.location.model: not used by ssh, the agent server sets the model"],
+    ['"location": { "type": "ssh", "host": "agents.test", "effort": "high" }', "backend.location.effort: not used by ssh, the agent server sets the reasoning effort"],
     ['"location": { "type": "ssh", "host": "agents.test", "permission": {} }', "backend.location.permission: not used by ssh"],
     ['"location": { "type": "ssh", "host": "agents.test", "hostname": "x" }', "unknown fields hostname"],
   ];
@@ -736,4 +739,37 @@ test("config: a personal location with another type replaces the shared one whol
   const docs = project.run(["profile", "docs"], { env: { RESOURCE_AGENT_CHAT: "chat1" } });
   assert.equal(docs.code, 0, docs.stderr);
   assert.match(docs.stdout, /Server: alice@docs\.test\n/);
+});
+
+test("effort: set when it differs, checked against the model's levels, ignored without levels", (t) => {
+  const project = makeProject({ local: `{ "resources": { "backend": { "location": { "effort": "high" } } } }` });
+  t.after(() => project.cleanup());
+  const env = { RESOURCE_AGENT_CHAT: "chat1" };
+  const efforts = () => project.calls().filter((call) => commandOf(call)[1] === "effort").map((call) => commandOf(call)[2]);
+  const writeLocal = (location) =>
+    fs.writeFileSync(
+      path.join(project.project, ".opencode", "resources.local.jsonc"),
+      JSON.stringify({ resources: { backend: { location } } }),
+    );
+
+  assert.equal(project.run(["backend", "first"], { env }).code, 0);
+  assert.equal(project.run(["backend", "second"], { env }).code, 0);
+  assert.deepEqual(efforts(), ["high"], "the same level is not set again");
+  assert.match(project.run(["status"]).stdout, /model fake\/model · effort high/);
+  assert.match(project.run(["profile", "backend"]).stdout, /^Effort: high$/m);
+
+  writeLocal({ effort: "xhigh" });
+  const unknown = project.run(["backend", "third"], { env });
+  assert.equal(unknown.code, 2);
+  assert.match(unknown.stderr, /effort "xhigh" is not available for fake\/model; available: low, medium, high, default/);
+
+  // after a model change the levels of the new model are checked: this one has none
+  writeLocal({ model: "fake/plain", effort: "high" });
+  const plain = project.run(["backend", "fourth"], { env });
+  assert.equal(plain.code, 0, plain.stderr);
+  assert.match(plain.stderr, /backend: fake\/plain has no effort levels, location\.effort is ignored/);
+  assert.deepEqual(efforts(), ["high"]);
+
+  writeLocal({ effort: "" });
+  assert.match(project.run(["backend", "fifth"], { env }).stderr, /backend\.location\.effort: expected a level/);
 });

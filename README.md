@@ -73,6 +73,7 @@ To update, change the tag and run `npm install` again, then restart OpenCode. Ve
         "type": "local",          // transport: the agent runs on this machine
         "path": "../product/back", // local checkout, relative to the folder that contains .opencode/
         "model": "provider/model", // optional: the agent's model
+        "effort": "high",          // optional: reasoning effort, default by default
         "permission": {}          // optional: OpenCode rules on top of the mode's profile
       }
     }
@@ -89,6 +90,11 @@ to the repositories. `resource-agent init` creates it from the template
 
 If no model is set, the resource's OpenCode silently uses its default model, which may be an external service.
 `resource-agent` warns about it.
+
+`effort` is the reasoning effort: one of the model's variants in OpenCode, usually `low`, `medium`, `high` and
+`default` (the provider's own level). Without it the level is `default`: otherwise a new conversation would start
+with the variant last chosen for this model in your own OpenCode. A level the model does not have is an error that
+lists the available ones; for a model without variants `effort` is ignored with a warning.
 
 ### A resource on an agent server (`ssh`)
 
@@ -109,7 +115,8 @@ accepts.
 }
 ```
 
-- `path`, `model` and `permission` are not allowed: the repository, the model and the permissions are on the server.
+- `path`, `model`, `effort` and `permission` are not allowed: the repository, the model, its reasoning effort and
+  the permissions are on the server.
   If the personal file still sets them for this resource, remove them there with `null`.
 - Only `plan` mode: the server's agent does not edit its repository.
 - `options` (`wait`, `timeout`, `ttl`) and the `RESOURCE_AGENT_WAIT`, `RESOURCE_AGENT_TIMEOUT`, `RESOURCE_AGENT_TTL`

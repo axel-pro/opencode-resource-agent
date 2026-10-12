@@ -5,7 +5,7 @@
 // (a command-line client for the ACP protocol). It sees its own AGENTS.md, skills and MCP servers.
 // Where the repositories live and how to reach them is described in the config of the asking project:
 //   .opencode/resources.jsonc        — shared, committed to git;
-//   .opencode/resources.local.jsonc  — personal (paths, model), merged on top of the shared one.
+//   .opencode/resources.local.jsonc  — personal (paths, model, effort), merged on top of the shared one.
 // The project is the nearest folder with .opencode/resources.jsonc, starting from the current one (see findProjectRoot).
 // The script is not tied to OpenCode as a client: it is called by the resource_agent tool
 // (src/index.ts in this package), by a person from a terminal, or by any other agent.
@@ -70,6 +70,8 @@ const CLIENT = "resource-agent";
 const COMMANDS = new Set(["status", "resources", "profile", "init", "help", "__job"]);
 const MODES = ["plan", "build"];
 const DEFAULT_OPTIONS = { wait: 450, timeout: 3600, ttl: 1800 };
+// The reasoning effort of a local agent when location.effort is not set: the model's own level.
+const DEFAULT_EFFORT = "default";
 // Limit for preparing a conversation, s: the first OpenCode start in a repository installs its plugins' dependencies.
 const PREP_TIMEOUT = 120;
 // Output limit for service commands, bytes. acpx sessions show prints the conversation record with the whole
@@ -322,13 +324,16 @@ const TRANSPORTS = {
       if (location.model !== undefined && (typeof location.model !== "string" || !location.model)) {
         errors.push(`${where}.model: expected a string like provider/model`);
       }
+      if (location.effort !== undefined && (typeof location.effort !== "string" || !location.effort)) {
+        errors.push(`${where}.effort: expected a level like low, medium, high or default`);
+      }
       if (location.permission !== undefined) {
         if (!isObject(location.permission)) errors.push(`${where}.permission: expected an object of OpenCode rules`);
         for (const key of askRules(location.permission)) {
           errors.push(`${where}.permission.${key}: "ask" is not supported, there is nobody to confirm; use allow or deny`);
         }
       }
-      const unknown = Object.keys(location).filter((key) => !["type", "path", "model", "permission"].includes(key));
+      const unknown = Object.keys(location).filter((key) => !["type", "path", "model", "effort", "permission"].includes(key));
       if (unknown.length) errors.push(`${where}: unknown fields ${unknown.join(", ")}`);
       return errors;
     },
@@ -371,6 +376,7 @@ const TRANSPORTS = {
       const unused = {
         path: "the repository is on the agent server",
         model: "the agent server sets the model",
+        effort: "the agent server sets the reasoning effort",
         permission: "the agent server sets the permissions",
       };
       for (const [key, why] of Object.entries(unused)) {
@@ -398,7 +404,7 @@ const TRANSPORTS = {
       return [
         `Server: ${sshAddress(resource.location)}`,
         `Chat: ${chat === "shared" ? "not set — set RESOURCE_AGENT_SESSION=<name>" : chat}`,
-        "Model and permissions: set by the agent server",
+        "Model, effort and permissions: set by the agent server",
         `ssh call: ${[sshBin(), ...sshArgs(resource.location, command)].map(shellQuote).join(" ")}`,
       ];
     },
@@ -714,7 +720,7 @@ function sessionRecord(target, conversation) {
 }
 
 // Prepares the conversation for a question: creates it if needed, applies changed permissions,
-// sets the mode and model.
+// sets the mode, model and reasoning effort.
 function prepare(ctx, mode, { fresh = false } = {}) {
   const { resource, target, conversation } = ctx;
   const model = resource.location.model;
@@ -732,8 +738,33 @@ function prepare(ctx, mode, { fresh = false } = {}) {
   }
   applyProfile(ctx, record, created);
   if (record?.acpx?.desired_config_options?.mode !== mode) acpxStep(target, ["set", "mode", mode, "-s", conversation]);
-  if (model && record?.acpx?.current_model_id !== model) acpxStep(target, ["set", "model", model, "-s", conversation]);
+  if (model && record?.acpx?.current_model_id !== model) {
+    acpxStep(target, ["set", "model", model, "-s", conversation]);
+    record = sessionRecord(target, conversation); // the effort levels depend on the model
+  }
+  applyEffort(ctx, record);
   return { created, model: model ?? record?.acpx?.current_model_id };
+}
+
+// The reasoning effort is an OpenCode session setting, "effort": the variants of the model. A new conversation
+// otherwise starts with the variant last chosen for this model in the person's own OpenCode, so the level is
+// always set: location.effort or DEFAULT_EFFORT. acpx keeps it in the conversation record and sets it again
+// when the agent process restarts. A model without variants has no such setting.
+function applyEffort({ resource, target, conversation }, record) {
+  const effort = resource.location.effort ?? DEFAULT_EFFORT;
+  const option = record?.acpx?.config_options?.find((entry) => entry.id === "effort");
+  const model = record?.acpx?.current_model_id ?? "the default model";
+  if (!option) {
+    if (resource.location.effort !== undefined) warn(`${resource.name}: ${model} has no effort levels, location.effort is ignored`);
+    return;
+  }
+  const levels = (option.options ?? []).map((entry) => entry.value);
+  if (!levels.includes(effort)) {
+    fail(`${resource.name}: effort "${effort}" is not available for ${model}; available: ${levels.join(", ")}`);
+  }
+  if (record.acpx.desired_config_options?.effort !== effort || option.currentValue !== effort) {
+    acpxStep(target, ["set", "effort", effort, "-s", conversation]);
+  }
 }
 
 // The agent gets its permissions when its process starts. If the profile changed since the last question,
@@ -1042,7 +1073,9 @@ function status() {
       check(ok, `${name}${aliases} · ${entry.location.type} · ${text}`);
       continue;
     }
-    const model = entry.location.model ? `model ${entry.location.model}` : "no model set — set location.model in the personal file";
+    const model = entry.location.model
+      ? `model ${entry.location.model}${entry.location.effort ? ` · effort ${entry.location.effort}` : ""}`
+      : "no model set — set location.model in the personal file";
     try {
       const target = transport.locate(resource);
       check(Boolean(entry.location.model), `${name}${aliases} · ${entry.location.type} · ${target.where} · ${target.details()} · ${model}`);
@@ -1092,6 +1125,7 @@ function profile(config, args) {
   out(`Folder: ${target.cwd}`);
   out(`Agent command: ${target.agentCommand}`);
   out(`Model: ${resource.location.model ?? "not set"}`);
+  out(`Effort: ${resource.location.effort ?? DEFAULT_EFFORT}`);
   out(`Mode: ${mode}`);
   out(`acpx call: acpx ${acpxArgs(target, []).map(shellQuote).join(" ")} …`);
   for (const [name, value] of Object.entries(target.env)) {
@@ -1141,7 +1175,8 @@ const LOCAL_TEMPLATE = `// Template for personal resource settings. resource-age
     // "backend": {
     //   "location": {
     //     "path": "~/work/backend",  // if your checkout is not where the shared file says
-    //     "model": "provider/model"  // the agent model; without it OpenCode uses its default model
+    //     "model": "provider/model", // the agent model; without it OpenCode uses its default model
+    //     "effort": "high"           // reasoning effort: low, medium, high…; default by default
     //   }
     // }
   }

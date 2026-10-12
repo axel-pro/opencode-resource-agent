@@ -10,6 +10,8 @@
 // a conversation is created or a question is asked, the way acpx reports it: its own code 1, the agent's in the text.
 // $FAKE_ACPX_HISTORY_BYTES adds a message history of that size to the sessions show output,
 // like the real acpx, which prints the whole conversation record.
+// Like OpenCode, a model has the "effort" setting with the levels low, medium, high and default, and a new
+// conversation starts with low; a model with "plain" in its name has no levels, as a model without variants.
 "use strict";
 
 const crypto = require("node:crypto");
@@ -52,6 +54,10 @@ const recordFile = (name) => path.join(dir, "records", `${safe(name)}.json`);
 const cancelFile = (name) => path.join(dir, `cancel-${safe(name)}`);
 const readRecord = (name) => (fs.existsSync(recordFile(name)) ? JSON.parse(fs.readFileSync(recordFile(name), "utf8")) : undefined);
 const writeRecord = (record) => fs.writeFileSync(recordFile(record.name), JSON.stringify(record));
+const effortOption = (model) =>
+  model.includes("plain")
+    ? []
+    : [{ id: "effort", category: "thought_level", type: "select", currentValue: "low", options: ["low", "medium", "high", "default"].map((value) => ({ value, name: value })) }];
 const noSession = (name) => {
   process.stderr.write(`[acpx] error: NO_SESSION ${name}\n`);
   process.exit(4);
@@ -85,7 +91,11 @@ if (command === "sessions") {
         acpxRecordId: crypto.randomUUID(),
         name,
         closed: false,
-        acpx: { desired_config_options: {}, current_model_id: options.model ?? "fake/default" },
+        acpx: {
+          desired_config_options: {},
+          current_model_id: options.model ?? "fake/default",
+          config_options: effortOption(options.model ?? "fake/default"),
+        },
       });
       console.log(JSON.stringify({ action: "session_ensured", created: true, name }));
     }
@@ -99,7 +109,19 @@ if (command === "sessions") {
   const record = readRecord(name);
   if (!record) noSession(name);
   if (key === "mode") record.acpx.desired_config_options.mode = value;
-  else if (key === "model") record.acpx.current_model_id = value;
+  else if (key === "model") {
+    record.acpx.current_model_id = value;
+    record.acpx.config_options = effortOption(value);
+    if (!record.acpx.config_options.length) delete record.acpx.desired_config_options.effort;
+  } else if (key === "effort") {
+    const option = record.acpx.config_options.find((entry) => entry.id === "effort");
+    if (!option) {
+      console.log(JSON.stringify({ error: { message: `Unknown config option: ${key}` } }));
+      process.exit(1);
+    }
+    option.currentValue = value;
+    record.acpx.desired_config_options.effort = value;
+  }
   writeRecord(record);
   console.log(JSON.stringify({ action: "config_set", configId: key, value }));
 } else if (command === "cancel") {
