@@ -773,3 +773,129 @@ test("effort: set when it differs, checked against the model's levels, ignored w
   writeLocal({ effort: "" });
   assert.match(project.run(["backend", "fifth"], { env }).stderr, /backend\.location\.effort: expected a level/);
 });
+
+// Another local agent: "claude" is a name from acpx's list; the fake acpx gives an agent with "claude" in its
+// command Claude Code's modes and the level setting "thinking".
+const CLAUDE_COMMAND = require("acpx/agent-registry").AGENT_REGISTRY.claude;
+const writeBackend = (project, location) =>
+  fs.writeFileSync(
+    path.join(project.project, ".opencode", "resources.local.jsonc"),
+    JSON.stringify({ resources: { backend: { location } } }),
+  );
+
+test("agent: another ACP agent gets its own command, modes and environment, but no OpenCode profile", (t) => {
+  const project = makeProject();
+  t.after(() => project.cleanup());
+  const env = { RESOURCE_AGENT_CHAT: "chat1" };
+  writeBackend(project, { agent: "claude", env: { FAKE_AGENT_VAR: "secret-value" } });
+
+  const asked = project.run(["backend", "question"], { env });
+  assert.equal(asked.code, 0, asked.stderr);
+  assert.match(asked.stdout, /^\[backend · local · agent claude · plan · .* · model fake\/model · new conversation\]$/m);
+  const calls = project.calls();
+  // without location.modes the agent stays in its own default mode, without location.effort at its own level
+  assert.deepEqual(
+    calls.map((call) => commandOf(call).slice(0, 2).join(" ")),
+    ["sessions show", "sessions ensure", "sessions show", "prompt -s"],
+  );
+  for (const call of calls) {
+    assert.equal(valueOf(call, "--agent"), CLAUDE_COMMAND);
+    for (const flag of ["--no-fs", "--no-terminal", "--deny-all"]) assert.ok(call.args.includes(flag), flag);
+    assert.equal(call.env.OPENCODE_CONFIG_CONTENT, undefined);
+    assert.equal(call.env.FAKE_AGENT_VAR, "secret-value");
+  }
+
+  // build only when the agent's build mode is named
+  const build = project.run(["backend", "--mode", "build", "edit"], { env });
+  assert.equal(build.code, 2);
+  assert.match(build.stderr, /agent claude has no build mode — name its mode in location\.modes\.build/);
+  const listed = JSON.parse(project.run(["resources", "--json"]).stdout);
+  assert.equal(listed.find((r) => r.name === "backend").build, false);
+  assert.equal(listed.find((r) => r.name === "frontend").build, true);
+
+  const profile = project.run(["profile", "backend"]);
+  assert.equal(profile.code, 0, profile.stderr);
+  assert.match(profile.stdout, /^Agent: claude$/m);
+  assert.match(profile.stdout, /^Effort: the agent's own$/m);
+  assert.match(profile.stdout, /^Mode: plan \(the agent's default mode\)$/m);
+  assert.match(profile.stdout, /^Environment: FAKE_AGENT_VAR$/m);
+  assert.match(profile.stdout, /^Permissions: no resource-agent profile/m);
+  assert.doesNotMatch(profile.stdout, /secret-value|OPENCODE_CONFIG_CONTENT/);
+  assert.match(project.run(["status"]).stdout, /✓ backend \(back, Émile\) · local · agent claude · /);
+
+  // the first start through npx may take longer than the preparation limit: the error says how to avoid it
+  const slow = project.run(["backend", "question"], { env: { RESOURCE_AGENT_CHAT: "chat2", FAKE_ACPX_PREP_TIMEOUT: "1" } });
+  assert.equal(slow.code, 3);
+  assert.match(slow.stderr, /acpx sessions ensure: Timed out after 120000ms\nacpx starts this agent with "npx .*claude-agent-acp.*", which downloads the adapter/);
+});
+
+test("agent: modes and effort map to the agent's own settings", (t) => {
+  const project = makeProject();
+  t.after(() => project.cleanup());
+  const env = { RESOURCE_AGENT_CHAT: "chat1" };
+  writeBackend(project, { agent: "claude", effort: "high", modes: { plan: "plan", build: "acceptEdits" } });
+  const sets = () => project.calls().filter((call) => commandOf(call)[0] === "set").map((call) => commandOf(call).slice(1, 3).join(" "));
+
+  assert.equal(project.run(["backend", "first"], { env }).code, 0);
+  const build = project.run(["backend", "--mode", "build", "second"], { env });
+  assert.equal(build.code, 0, build.stderr);
+  assert.match(build.stdout, /· agent claude · build ·/);
+  // a plan question after an edit switches the agent back
+  assert.equal(project.run(["backend", "third"], { env }).code, 0);
+  assert.deepEqual(sets(), ["mode plan", "thinking high", "mode acceptEdits", "mode plan"]);
+  assert.match(project.run(["profile", "backend", "--mode", "build"]).stdout, /^Mode: build \(agent mode acceptEdits\)$/m);
+
+  writeBackend(project, { agent: "claude", modes: { plan: "plan", build: "auto" } });
+  const unknown = project.run(["backend", "--mode", "build", "fourth"], { env });
+  assert.equal(unknown.code, 2);
+  assert.match(unknown.stderr, /mode "auto" \(build\) is not available for agent claude; available: default, acceptEdits, plan/);
+});
+
+test("agent: a command as the agent; an agent without a mode setting gets set-mode", (t) => {
+  const project = makeProject();
+  t.after(() => project.cleanup());
+  const env = { RESOURCE_AGENT_CHAT: "chat1" };
+  writeBackend(project, { agent: "/usr/bin/env modeless-agent --acp", modes: { plan: "ask", build: "code" } });
+
+  assert.equal(project.run(["backend", "first"], { env }).code, 0);
+  assert.equal(project.run(["backend", "second"], { env }).code, 0);
+  assert.equal(project.run(["backend", "--mode", "build", "third"], { env }).code, 0);
+  const calls = project.calls();
+  assert.equal(valueOf(calls[0], "--agent"), "/usr/bin/env modeless-agent --acp");
+  assert.deepEqual(
+    calls.filter((call) => commandOf(call)[0] === "set-mode").map((call) => commandOf(call)[1]),
+    ["ask", "code"],
+  );
+  assert.equal(project.record("resource-agent:backend:chat1").acpx.desired_mode_id, "code");
+
+  // a command is not downloaded by acpx, so a slow start gets no hint about installing an adapter
+  const slow = project.run(["backend", "--new"], { env: { RESOURCE_AGENT_CHAT: "chat2", FAKE_ACPX_PREP_TIMEOUT: "1" } });
+  assert.equal(slow.code, 3);
+  assert.doesNotMatch(slow.stderr, /install it/);
+
+  writeBackend(project, { agent: "no-such-agent" });
+  const missing = project.run(["backend", "fourth"], { env });
+  assert.equal(missing.code, 2);
+  assert.match(missing.stderr, /agent "no-such-agent" is neither an acpx agent \(.*claude.*\) nor a command in PATH/);
+});
+
+test("agent: config errors", (t) => {
+  const cases = [
+    [{ agent: "" }, "backend.location.agent: expected an acpx agent name"],
+    [{ modes: { plan: "plan" } }, "backend.location.modes: OpenCode's modes come from the resource-agent profile"],
+    [{ agent: "claude", modes: { build: "acceptEdits" } }, "backend.location.modes.build needs modes.plan too"],
+    [{ agent: "claude", modes: { plan: "plan", review: "x" } }, "backend.location.modes.review: unknown mode"],
+    [{ agent: "claude", permission: { bash: "deny" } }, "backend.location.permission: only OpenCode rules are supported"],
+    [{ env: { OPENCODE_CONFIG_CONTENT: "{}" } }, "backend.location.env.OPENCODE_CONFIG_CONTENT: set by resource-agent itself"],
+    [{ agent: "claude", env: { RESOURCE_AGENT_CHAT: "x" } }, "backend.location.env.RESOURCE_AGENT_CHAT: set by resource-agent itself"],
+    [{ agent: "claude", env: { PORT: 1 } }, "backend.location.env.PORT: expected a string"],
+  ];
+  for (const [location, expected] of cases) {
+    const project = makeProject();
+    t.after(() => project.cleanup());
+    writeBackend(project, location);
+    const result = project.run(["backend", "question"]);
+    assert.equal(result.code, 2, `${expected}: ${result.stderr}`);
+    assert.ok(result.stderr.includes(expected), `${expected}: ${result.stderr}`);
+  }
+});

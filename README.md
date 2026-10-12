@@ -8,8 +8,8 @@ guessing it asks the agent of the right repository. Such repositories are called
 The package has three parts:
 
 - **CLI `resource-agent`** — the transport. Through [acpx](https://github.com/openclaw/acpx) (a command-line
-  client for the ACP protocol) it starts a separate OpenCode in the resource's folder with restricted permissions,
-  sends it the question and returns the answer. No model is involved in the transport itself.
+  client for the ACP protocol) it starts a separate OpenCode (or another ACP agent) in the resource's folder with
+  restricted permissions, sends it the question and returns the answer. No model is involved in the transport itself.
 - **OpenCode plugin** — the `resource_agent` tool, a wrapper over the CLI. Its description lists the configured
   resources, so the agent knows whom it can ask.
 - **Skill `resource-agents`** — instructions for the asking agent: how to write a question, when to follow up,
@@ -74,7 +74,8 @@ To update, change the tag and run `npm install` again, then restart OpenCode. Ve
         "path": "../product/back", // local checkout, relative to the folder that contains .opencode/
         "model": "provider/model", // optional: the agent's model
         "effort": "high",          // optional: reasoning effort, default by default
-        "permission": {}          // optional: OpenCode rules on top of the mode's profile
+        "permission": {},          // optional: OpenCode rules on top of the mode's profile
+        "env": {}                  // optional: environment variables of the agent
       }
     }
   }
@@ -95,6 +96,42 @@ If no model is set, the resource's OpenCode silently uses its default model, whi
 `default` (the provider's own level). Without it the level is `default`: otherwise a new conversation would start
 with the variant last chosen for this model in your own OpenCode. A level the model does not have is an error that
 lists the available ones; for a model without variants `effort` is ignored with a warning.
+
+`env` sets environment variables of the agent process, for example a proxy or an API address. Variables that
+`resource-agent` sets itself (`OPENCODE_CONFIG_CONTENT`, the chat id) cannot be overridden. `profile` shows only
+the names of these variables, since their values may be secrets.
+
+### Another agent instead of OpenCode (`agent`)
+
+A `local` resource is answered by OpenCode unless `location.agent` names another
+[ACP](https://agentclientprotocol.com) agent:
+
+```jsonc
+"location": {
+  "type": "local",
+  "path": "../product/back",
+  "agent": "claude",                                    // an acpx agent name or the command that starts an ACP agent
+  "model": "claude-sonnet-5",                            // optional: passed to the agent as is
+  "effort": "high",                                      // optional: the agent's reasoning level, as is
+  "modes": { "plan": "plan", "build": "acceptEdits" },  // optional: the agent's own ids of plan and build
+  "env": { "HTTPS_PROXY": "http://127.0.0.1:8080" }      // optional
+}
+```
+
+- `agent` is either a name from the acpx agent list (`claude`, `codex`, `gemini`, `cursor`, `qwen`, `kimi` and
+  others; an unknown name is an error that lists them) or a command, such as `/opt/bin/my-agent --acp`.
+  For a name, acpx prefers an adapter installed next to it and otherwise downloads it through `npx` on every start;
+  the first download may take longer than the 120 s preparation limit. So install the adapter in the asking project
+  in advance — for Claude Code `npm install -D @agentclientprotocol/claude-agent-acp@^0.81.2`. Keep to the version
+  range from acpx's command: acpx 0.19.4 targets it and uses an installed adapter without checking its version.
+- `model` and `effort` are passed to the agent as they are: the ids are the agent's own. A level the agent does not
+  have is an error that lists the available ones. Without `effort` the agent keeps its own level.
+- `modes` maps `plan` and `build` to the agent's own modes: in Claude Code, for example, `default`, `acceptEdits`
+  and `plan`. Without `modes.plan` the agent answers in its default mode. `build` is available only when
+  `modes.build` is set, and then `modes.plan` is required too: otherwise a question after an edit would stay in the
+  build mode. The `resource_agent` tool marks a resource without `modes.build` as read-only.
+- `permission` is not allowed: it is a set of OpenCode rules. See "Modes and permissions" for what that means.
+- Switching the agent starts a new conversation with the resource: acpx keeps conversations per agent command.
 
 ### A resource on an agent server (`ssh`)
 
@@ -231,6 +268,16 @@ cannot weaken it.
   and the conversation continues.
 - Shell is forbidden to the resource agent in `build`, so it cannot run tests in its repository.
 
+**Another agent (`location.agent`) gets no profile.** Its only restriction is acpx `--deny-all`: whatever the agent
+asks permission for is refused. That depends on the agent and the repository, not on `resource-agent`:
+
+- what the repository's own settings for that agent allow (for Claude Code, `allow` rules in `.claude/settings.json`),
+  the agent does without asking — shell commands included;
+- in `build` mode it may edit any file, including those settings, `AGENTS.md`, `CLAUDE.md` and `.git/`, and on the next
+  start the agent would run with what it wrote there.
+
+Use another agent for repositories whose agent settings you trust. `resource-agent profile <resource>` says the same.
+
 ## Adding a resource
 
 Add an entry to `resources` in the shared file: a name (`a-z`, `0-9`, `-`), a description (the asking agent decides
@@ -251,7 +298,7 @@ A transport is a way to deliver a question to a resource agent, the `location.ty
 in the `TRANSPORTS` table in `bin/resource-agent`. Each transport says whether it supports `build`, validates its
 settings and, for a resource, returns:
 
-- the command acpx starts as the agent;
+- the command acpx starts as the agent, and the agent's ids of the `plan` and `build` modes;
 - the session folder;
 - the agent's environment variables;
 - the address and checkout details for the source line.

@@ -12,6 +12,9 @@
 // like the real acpx, which prints the whole conversation record.
 // Like OpenCode, a model has the "effort" setting with the levels low, medium, high and default, and a new
 // conversation starts with low; a model with "plain" in its name has no levels, as a model without variants.
+// The mode is the "mode" setting with plan and build. An agent command with "claude" in it has Claude Code's modes
+// default, acceptEdits and plan and the level setting "thinking" (ACP category thought_level); with "modeless" in it
+// the agent has no mode setting and takes a mode only through set-mode, like an agent without config options.
 "use strict";
 
 const crypto = require("node:crypto");
@@ -20,7 +23,7 @@ const path = require("node:path");
 
 const dir = process.env.FAKE_ACPX_DIR;
 const args = process.argv.slice(2);
-const logged = ["OPENCODE_CONFIG_CONTENT", "OPENCODE_DISABLE_AUTOUPDATE", "RESOURCE_AGENT_CHAT", "RESOURCE_AGENT_SESSION", "OPENCODE_SESSION_ID", "OPENCODE_PERMISSION"];
+const logged = ["OPENCODE_CONFIG_CONTENT", "OPENCODE_DISABLE_AUTOUPDATE", "RESOURCE_AGENT_CHAT", "RESOURCE_AGENT_SESSION", "OPENCODE_SESSION_ID", "OPENCODE_PERMISSION", "FAKE_AGENT_VAR"];
 fs.mkdirSync(path.join(dir, "records"), { recursive: true });
 fs.appendFileSync(
   path.join(dir, "calls.jsonl"),
@@ -54,10 +57,15 @@ const recordFile = (name) => path.join(dir, "records", `${safe(name)}.json`);
 const cancelFile = (name) => path.join(dir, `cancel-${safe(name)}`);
 const readRecord = (name) => (fs.existsSync(recordFile(name)) ? JSON.parse(fs.readFileSync(recordFile(name), "utf8")) : undefined);
 const writeRecord = (record) => fs.writeFileSync(recordFile(record.name), JSON.stringify(record));
+const agent = options.agent ?? "";
+const select = (id, category, currentValue, values) => ({ id, category, type: "select", currentValue, options: values.map((value) => ({ value, name: value })) });
 const effortOption = (model) =>
-  model.includes("plain")
-    ? []
-    : [{ id: "effort", category: "thought_level", type: "select", currentValue: "low", options: ["low", "medium", "high", "default"].map((value) => ({ value, name: value })) }];
+  model.includes("plain") ? [] : [select(agent.includes("claude") ? "thinking" : "effort", "thought_level", "low", ["low", "medium", "high", "default"])];
+const modeOption = () => {
+  if (agent.includes("modeless")) return [];
+  return [agent.includes("claude") ? select("mode", "mode", "default", ["default", "acceptEdits", "plan"]) : select("mode", "mode", "build", ["plan", "build"])];
+};
+const configOptions = (model) => [...modeOption(), ...effortOption(model)];
 const noSession = (name) => {
   process.stderr.write(`[acpx] error: NO_SESSION ${name}\n`);
   process.exit(4);
@@ -72,6 +80,12 @@ if (agentExit && command === "sessions" && ["ensure", "new"].includes(rest[0])) 
 if (agentExit && command === "prompt") {
   process.stderr.write(`[acpx] error: RUNTIME AGENT_STARTUP_FAILED ${startupFailure}\n`);
   process.exit(1);
+}
+
+// $FAKE_ACPX_PREP_TIMEOUT: creating a conversation does not finish in time, like a slow first start of an agent.
+if (process.env.FAKE_ACPX_PREP_TIMEOUT && command === "sessions" && ["ensure", "new"].includes(rest[0])) {
+  console.log(JSON.stringify({ error: { message: "Timed out after 120000ms" } }));
+  process.exit(3);
 }
 
 if (command === "sessions") {
@@ -94,7 +108,7 @@ if (command === "sessions") {
         acpx: {
           desired_config_options: {},
           current_model_id: options.model ?? "fake/default",
-          config_options: effortOption(options.model ?? "fake/default"),
+          config_options: configOptions(options.model ?? "fake/default"),
         },
       });
       console.log(JSON.stringify({ action: "session_ensured", created: true, name }));
@@ -108,22 +122,31 @@ if (command === "sessions") {
   const name = flag("-s");
   const record = readRecord(name);
   if (!record) noSession(name);
-  if (key === "mode") record.acpx.desired_config_options.mode = value;
-  else if (key === "model") {
+  if (key === "model") {
     record.acpx.current_model_id = value;
-    record.acpx.config_options = effortOption(value);
-    if (!record.acpx.config_options.length) delete record.acpx.desired_config_options.effort;
-  } else if (key === "effort") {
-    const option = record.acpx.config_options.find((entry) => entry.id === "effort");
+    const levels = record.acpx.config_options.filter((entry) => entry.category === "thought_level");
+    record.acpx.config_options = [...record.acpx.config_options.filter((entry) => entry.category !== "thought_level"), ...effortOption(value)];
+    for (const entry of levels) if (!effortOption(value).length) delete record.acpx.desired_config_options[entry.id];
+  } else {
+    const option = record.acpx.config_options.find((entry) => entry.id === key);
     if (!option) {
       console.log(JSON.stringify({ error: { message: `Unknown config option: ${key}` } }));
       process.exit(1);
     }
     option.currentValue = value;
-    record.acpx.desired_config_options.effort = value;
+    record.acpx.desired_config_options[key] = value;
   }
   writeRecord(record);
   console.log(JSON.stringify({ action: "config_set", configId: key, value }));
+} else if (command === "set-mode") {
+  const [mode] = rest;
+  const name = flag("-s");
+  const record = readRecord(name);
+  if (!record) noSession(name);
+  record.acpx.desired_mode_id = mode;
+  record.acpx.current_mode_id = mode;
+  writeRecord(record);
+  console.log(JSON.stringify({ action: "mode_set", modeId: mode }));
 } else if (command === "cancel") {
   fs.writeFileSync(cancelFile(flag("-s")), "");
   console.log(JSON.stringify({ action: "cancel_requested" }));

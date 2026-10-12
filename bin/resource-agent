@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 // resource-agent — the transport: asks an agent of another repository a question and returns its answer.
 //
-// The agent of another repository is OpenCode started in that repository's folder through acpx
-// (a command-line client for the ACP protocol). It sees its own AGENTS.md, skills and MCP servers.
+// The agent of another repository is OpenCode (or another ACP agent, location.agent) started in that repository's
+// folder through acpx (a command-line client for the ACP protocol). It sees its own AGENTS.md, skills and MCP servers.
 // Where the repositories live and how to reach them is described in the config of the asking project:
 //   .opencode/resources.jsonc        — shared, committed to git;
 //   .opencode/resources.local.jsonc  — personal (paths, model, effort), merged on top of the shared one.
@@ -70,7 +70,9 @@ const CLIENT = "resource-agent";
 const COMMANDS = new Set(["status", "resources", "profile", "init", "help", "__job"]);
 const MODES = ["plan", "build"];
 const DEFAULT_OPTIONS = { wait: 450, timeout: 3600, ttl: 1800 };
-// The reasoning effort of a local agent when location.effort is not set: the model's own level.
+// The local agent when location.agent is not set. Only for it resource-agent has a permission profile.
+const DEFAULT_AGENT = "opencode";
+// The reasoning effort of a local OpenCode agent when location.effort is not set: the model's own level.
 const DEFAULT_EFFORT = "default";
 // Limit for preparing a conversation, s: the first OpenCode start in a repository installs its plugins' dependencies.
 const PREP_TIMEOUT = 120;
@@ -305,7 +307,7 @@ function findResource(config, key) {
 
 // A transport is a way to deliver a question to a resource agent. The key is location.type in the config.
 // Each transport describes:
-//   build      — whether it supports build mode (editing files);
+//   build      — whether a resource supports build mode (editing files): a function of its location;
 //   validate   — errors in the location settings;
 //   locate     — how to start the agent: the command for acpx (agentCommand), the session folder (cwd),
 //                the agent's environment (env), the address for the source line (where),
@@ -317,43 +319,95 @@ function findResource(config, key) {
 //   describe — lines for profile.
 const TRANSPORTS = {
   local: {
-    build: true,
+    // OpenCode gets build mode from its profile; another agent only if its build mode is named in location.modes.
+    build: (location) => isOpencode(location) || Boolean(location.modes?.build),
     validate(location, where) {
       const errors = [];
+      const opencode = isOpencode(location);
       if (typeof location.path !== "string" || !location.path) errors.push(`${where}.path: expected a path to the local checkout`);
+      if (location.agent !== undefined && (typeof location.agent !== "string" || !location.agent.trim())) {
+        errors.push(`${where}.agent: expected an acpx agent name like claude or codex, or the command that starts an ACP agent`);
+      }
       if (location.model !== undefined && (typeof location.model !== "string" || !location.model)) {
-        errors.push(`${where}.model: expected a string like provider/model`);
+        errors.push(`${where}.model: expected a model id of the agent, like provider/model for OpenCode`);
       }
       if (location.effort !== undefined && (typeof location.effort !== "string" || !location.effort)) {
         errors.push(`${where}.effort: expected a level like low, medium, high or default`);
       }
+      if (location.modes !== undefined) {
+        if (opencode) errors.push(`${where}.modes: OpenCode's modes come from the resource-agent profile; remove it`);
+        else if (!isObject(location.modes)) errors.push(`${where}.modes: expected an object like { "plan": "plan", "build": "acceptEdits" }`);
+        else {
+          for (const [key, value] of Object.entries(location.modes)) {
+            if (!MODES.includes(key)) errors.push(`${where}.modes.${key}: unknown mode; allowed: ${MODES.join(", ")}`);
+            else if (typeof value !== "string" || !value) errors.push(`${where}.modes.${key}: expected a mode id of the agent`);
+          }
+          // Without a plan mode the agent would stay in its build mode after a build question in the same conversation.
+          if (location.modes.build && !location.modes.plan) {
+            errors.push(`${where}.modes.build needs modes.plan too: otherwise the next question after an edit stays in the build mode`);
+          }
+        }
+      }
       if (location.permission !== undefined) {
-        if (!isObject(location.permission)) errors.push(`${where}.permission: expected an object of OpenCode rules`);
+        if (!opencode) errors.push(`${where}.permission: only OpenCode rules are supported; agent ${location.agent} gets only acpx --deny-all`);
+        else if (!isObject(location.permission)) errors.push(`${where}.permission: expected an object of OpenCode rules`);
         for (const key of askRules(location.permission)) {
           errors.push(`${where}.permission.${key}: "ask" is not supported, there is nobody to confirm; use allow or deny`);
         }
       }
-      const unknown = Object.keys(location).filter((key) => !["type", "path", "model", "effort", "permission"].includes(key));
+      if (location.env !== undefined) {
+        if (!isObject(location.env)) errors.push(`${where}.env: expected an object of environment variables`);
+        else {
+          const reserved = [...CHILD_ENV_DROP, ...(opencode ? OPENCODE_ENV : [])];
+          for (const [key, value] of Object.entries(location.env)) {
+            if (typeof value !== "string") errors.push(`${where}.env.${key}: expected a string`);
+            else if (reserved.includes(key)) errors.push(`${where}.env.${key}: set by resource-agent itself`);
+          }
+        }
+      }
+      const fields = ["type", "path", "agent", "model", "effort", "modes", "permission", "env"];
+      const unknown = Object.keys(location).filter((key) => !fields.includes(key));
       if (unknown.length) errors.push(`${where}: unknown fields ${unknown.join(", ")}`);
       return errors;
     },
     locate(resource) {
-      const dir = resolvePath(resource.location.path);
+      const { location } = resource;
+      const dir = resolvePath(location.path);
       if (!fs.existsSync(dir)) {
         fail(`${resource.name}: folder ${dir} does not exist — clone the repository or set the path in ${rel(LOCAL_FILE)}`);
       }
       const cwd = fs.realpathSync(dir);
       if (cwd === fs.realpathSync(ROOT)) fail(`${resource.name}: the path points to the project itself, ${ROOT}`);
+      const common = { cwd, where: cwd, details: () => gitDetails(cwd), ownEnv: Object.keys(location.env ?? {}) };
+      if (isOpencode(location)) {
+        return {
+          ...common,
+          agent: DEFAULT_AGENT,
+          agentCommand: `${quoteArg(opencodeBin())} acp`,
+          env: {
+            ...location.env,
+            OPENCODE_CONFIG_CONTENT: JSON.stringify(opencodeProfile(location.permission)),
+            OPENCODE_DISABLE_AUTOUPDATE: "1",
+          },
+          modes: { plan: "plan", build: "build" },
+          defaultEffort: DEFAULT_EFFORT,
+          profiled: true,
+          checkAgent: checkOpencodeVersion,
+        };
+      }
+      const command = agentCommand(resource);
       return {
-        agentCommand: `${quoteArg(opencodeBin())} acp`,
-        cwd,
-        env: {
-          OPENCODE_CONFIG_CONTENT: JSON.stringify(opencodeProfile(resource.location.permission)),
-          OPENCODE_DISABLE_AUTOUPDATE: "1",
-        },
-        where: cwd,
-        details: () => gitDetails(cwd),
-        checkAgent: checkOpencodeVersion,
+        ...common,
+        agent: location.agent.trim(),
+        agentCommand: command,
+        // acpx downloads a built-in adapter it does not find installed, and on the first start the download
+        // alone may take longer than the preparation limit.
+        startHint: /^(npx|npm exec) /.test(command)
+          ? `acpx starts this agent with "${command}", which downloads the adapter if it is not installed; install it in the asking project in advance (npm install <the package from that command>)`
+          : undefined,
+        env: { ...location.env },
+        modes: location.modes ?? {},
+        profiled: false,
       };
     },
   },
@@ -361,7 +415,7 @@ const TRANSPORTS = {
   // resource-agent/1 protocol over SSH; the server's resource-agent asks its agent, and the server sets
   // the model and permissions. Answers, messages and the exit code come back as is.
   ssh: {
-    build: false,
+    build: () => false,
     validate(location, where) {
       const errors = [];
       if (typeof location.host !== "string" || !SSH_HOST.test(location.host)) {
@@ -410,6 +464,37 @@ const TRANSPORTS = {
     },
   },
 };
+
+// Variables resource-agent sets for a local OpenCode agent; location.env cannot override them.
+const OPENCODE_ENV = ["OPENCODE_CONFIG_CONTENT", "OPENCODE_DISABLE_AUTOUPDATE"];
+
+const isOpencode = (location) => (location.agent ?? DEFAULT_AGENT).trim() === DEFAULT_AGENT;
+
+// The command that starts another local agent. A name acpx knows (claude, codex, gemini…) becomes the command
+// from acpx's own list: for such a command acpx itself prefers an installed adapter and otherwise runs it through npx.
+// It is passed to acpx as --agent rather than as a name, because acpx would look a name up in .acpxrc.json in the
+// resource's folder too, and the resource could start another program under it. Anything else is a command as is.
+function agentCommand(resource) {
+  const agent = resource.location.agent.trim();
+  const known = acpxAgents();
+  if (Object.hasOwn(known, agent)) return known[agent];
+  const [program] = agent.split(/\s+/);
+  if (!program.includes("/") && !which(program)) {
+    fail(`${resource.name}: agent "${agent}" is neither an acpx agent (${Object.keys(known).join(", ")}) nor a command in PATH`);
+  }
+  return agent;
+}
+
+let knownAgents;
+function acpxAgents() {
+  if (knownAgents) return knownAgents;
+  try {
+    knownAgents = require("acpx/agent-registry").AGENT_REGISTRY;
+  } catch (error) {
+    fail(`could not load the acpx agent list: ${error.message}`, 1);
+  }
+  return knownAgents;
+}
 
 // The resource agent's profile for OpenCode 1.x. It is passed through OPENCODE_CONFIG_CONTENT: OpenCode applies it
 // on top of the repository's own opencode.json, and the repository cannot weaken it. Rules are set for the plan
@@ -709,7 +794,8 @@ function acpxStep(target, args) {
   const reply = parseJsonOutput(result.stdout);
   if (result.status !== 0) {
     const message = reply?.error?.message ?? (result.stderr || result.stdout || "").trim();
-    fail(`${describeAcpx(args)}: ${message || `code ${result.status}`}`, agentStartupCode(message) ?? (result.status || 1));
+    const hint = result.status === 3 && target.startHint ? `\n${target.startHint}` : "";
+    fail(`${describeAcpx(args)}: ${message || `code ${result.status}`}${hint}`, agentStartupCode(message) ?? (result.status || 1));
   }
   return reply;
 }
@@ -729,7 +815,8 @@ function prepare(ctx, mode, { fresh = false } = {}) {
   if (!record || record.closed) {
     target.checkAgent?.();
     if (!model) {
-      warn(`${resource.name}: no model set — the agent will use its OpenCode's default model, which may be an external service. Set location.model in ${rel(LOCAL_FILE)}`);
+      const owner = target.profiled ? "its OpenCode's" : `${target.agent}'s`;
+      warn(`${resource.name}: no model set — the agent will use ${owner} default model, which may be an external service. Set location.model in ${rel(LOCAL_FILE)}`);
     }
     const modelArgs = model ? ["--model", model] : [];
     const reply = acpxStep(target, [...modelArgs, "sessions", fresh ? "new" : "ensure", "--name", conversation]);
@@ -737,7 +824,7 @@ function prepare(ctx, mode, { fresh = false } = {}) {
     record = sessionRecord(target, conversation);
   }
   applyProfile(ctx, record, created);
-  if (record?.acpx?.desired_config_options?.mode !== mode) acpxStep(target, ["set", "mode", mode, "-s", conversation]);
+  applyMode(ctx, record, mode);
   if (model && record?.acpx?.current_model_id !== model) {
     acpxStep(target, ["set", "model", model, "-s", conversation]);
     record = sessionRecord(target, conversation); // the effort levels depend on the model
@@ -746,13 +833,40 @@ function prepare(ctx, mode, { fresh = false } = {}) {
   return { created, model: model ?? record?.acpx?.current_model_id };
 }
 
-// The reasoning effort is an OpenCode session setting, "effort": the variants of the model. A new conversation
-// otherwise starts with the variant last chosen for this model in the person's own OpenCode, so the level is
-// always set: location.effort or DEFAULT_EFFORT. acpx keeps it in the conversation record and sets it again
-// when the agent process restarts. A model without variants has no such setting.
+// A session setting of the agent: by its id in OpenCode or, for other agents, by its ACP category.
+function configOption(record, id, category) {
+  const options = record?.acpx?.config_options ?? [];
+  return options.find((entry) => entry.id === id) ?? options.find((entry) => entry.category === category);
+}
+
+// Mode ids differ between agents: OpenCode has plan and build, Claude Code default, acceptEdits and plan.
+// target.modes maps resource-agent's modes to them; without an id the agent stays in its own default mode.
+// An agent exposes its mode either as a session setting (category "mode") or only through the older
+// session/set_mode call; acpx keeps either in the conversation record and sets it again after a restart.
+function applyMode({ resource, target, conversation }, record, mode) {
+  const id = target.modes[mode];
+  if (!id) return;
+  const option = configOption(record, "mode", "mode");
+  if (!option) {
+    if (record?.acpx?.desired_mode_id !== id) acpxStep(target, ["set-mode", id, "-s", conversation]);
+    return;
+  }
+  const available = (option.options ?? []).map((entry) => entry.value);
+  if (available.length && !available.includes(id)) {
+    fail(`${resource.name}: mode "${id}" (${mode}) is not available for agent ${target.agent}; available: ${available.join(", ")}`);
+  }
+  if (record.acpx.desired_config_options?.[option.id] !== id) acpxStep(target, ["set", option.id, id, "-s", conversation]);
+}
+
+// The reasoning effort is a session setting of the model, in OpenCode "effort": the variants of the model.
+// A new OpenCode conversation otherwise starts with the variant last chosen for this model in the person's own
+// OpenCode, so for it the level is always set: location.effort or DEFAULT_EFFORT. Other agents keep their own
+// level unless location.effort is set. acpx keeps the level in the conversation record and sets it again
+// when the agent process restarts. A model without levels has no such setting.
 function applyEffort({ resource, target, conversation }, record) {
-  const effort = resource.location.effort ?? DEFAULT_EFFORT;
-  const option = record?.acpx?.config_options?.find((entry) => entry.id === "effort");
+  const effort = resource.location.effort ?? target.defaultEffort;
+  if (effort === undefined) return;
+  const option = configOption(record, "effort", "thought_level");
   const model = record?.acpx?.current_model_id ?? "the default model";
   if (!option) {
     if (resource.location.effort !== undefined) warn(`${resource.name}: ${model} has no effort levels, location.effort is ignored`);
@@ -762,12 +876,12 @@ function applyEffort({ resource, target, conversation }, record) {
   if (!levels.includes(effort)) {
     fail(`${resource.name}: effort "${effort}" is not available for ${model}; available: ${levels.join(", ")}`);
   }
-  if (record.acpx.desired_config_options?.effort !== effort || option.currentValue !== effort) {
-    acpxStep(target, ["set", "effort", effort, "-s", conversation]);
+  if (record.acpx.desired_config_options?.[option.id] !== effort || option.currentValue !== effort) {
+    acpxStep(target, ["set", option.id, effort, "-s", conversation]);
   }
 }
 
-// The agent gets its permissions when its process starts. If the profile changed since the last question,
+// The agent gets its permissions and environment when its process starts. If they changed since the last question,
 // the process is stopped: the next acpx call starts the agent with the new permissions and loads the same
 // conversation from disk.
 function applyProfile({ target, conversation }, record, created) {
@@ -1020,7 +1134,9 @@ function startOver(ctx) {
 
 // The first line of an answer: which resource answered, where and in which mode.
 function sourceLine({ resource, target }, meta) {
-  const parts = [resource.name, resource.location.type, meta.mode ?? "plan", target.where, target.details()];
+  const parts = [resource.name, resource.location.type];
+  if (!target.profiled) parts.push(`agent ${target.agent}`);
+  parts.push(meta.mode ?? "plan", target.where, target.details());
   parts.push(meta.model ? `model ${meta.model}` : "default model");
   if (meta.created) parts.push("new conversation");
   return `[${parts.join(" · ")}]`;
@@ -1078,7 +1194,8 @@ function status() {
       : "no model set — set location.model in the personal file";
     try {
       const target = transport.locate(resource);
-      check(Boolean(entry.location.model), `${name}${aliases} · ${entry.location.type} · ${target.where} · ${target.details()} · ${model}`);
+      const agent = target.profiled ? "" : ` · agent ${target.agent}`;
+      check(Boolean(entry.location.model), `${name}${aliases} · ${entry.location.type}${agent} · ${target.where} · ${target.details()} · ${model}`);
       const job = readJob(conversationName(resource));
       if (job) out(`      question in progress: ${{ running: "the agent is answering", done: "answer ready, collect it with --wait", lost: "broke off" }[job.state]}`);
     } catch (error) {
@@ -1098,7 +1215,7 @@ function listResources(config, args) {
     description: entry.description ?? "",
     tags: (entry.tags ?? []).map((tag) => tag.trim()),
     type: entry.location.type,
-    build: Boolean(TRANSPORTS[entry.location.type].build),
+    build: TRANSPORTS[entry.location.type].build(entry.location),
   }));
   if (args.includes("--json")) out(JSON.stringify(list));
   else {
@@ -1115,7 +1232,7 @@ function profile(config, args) {
   if (words.length !== 1) fail("usage: resource-agent profile <resource> [--mode plan|build]");
   const resource = findResource(config, words[0]);
   const transport = TRANSPORTS[resource.location.type];
-  if (mode === "build" && !transport.build) fail(`${resource.name}: transport ${resource.location.type} does not support build mode`);
+  if (mode === "build") refuseBuild(resource);
   if (transport.describe) {
     for (const line of transport.describe(resource)) out(line);
     return 0;
@@ -1123,12 +1240,22 @@ function profile(config, args) {
   const target = transport.locate(resource);
   out(`Conversation: ${conversationName(resource)}`);
   out(`Folder: ${target.cwd}`);
+  out(`Agent: ${target.agent}`);
   out(`Agent command: ${target.agentCommand}`);
   out(`Model: ${resource.location.model ?? "not set"}`);
-  out(`Effort: ${resource.location.effort ?? DEFAULT_EFFORT}`);
-  out(`Mode: ${mode}`);
+  out(`Effort: ${resource.location.effort ?? target.defaultEffort ?? "the agent's own"}`);
+  out(`Mode: ${mode}${target.modes[mode] ? ` (agent mode ${target.modes[mode]})` : " (the agent's default mode)"}`);
   out(`acpx call: acpx ${acpxArgs(target, []).map(shellQuote).join(" ")} …`);
+  // Values of the resource's own variables may be secrets, so only their names are shown.
+  if (target.ownEnv.length) out(`Environment: ${target.ownEnv.join(", ")}`);
+  if (!target.profiled) {
+    out("Permissions: no resource-agent profile — the agent only gets acpx --deny-all, which refuses what it asks");
+    out("  permission for. What the repository's own agent settings allow, it does without asking, and in build mode");
+    out("  it may edit those settings, AGENTS.md and CLAUDE.md as well.");
+    return 0;
+  }
   for (const [name, value] of Object.entries(target.env)) {
+    if (target.ownEnv.includes(name)) continue;
     out(`${name}:`);
     out(name === "OPENCODE_CONFIG_CONTENT" ? JSON.stringify(JSON.parse(value), null, 2) : value);
   }
@@ -1210,6 +1337,13 @@ function init() {
     out(`${rel(gitignore)}: added ${missing.join(", ")}`);
   }
   return 0;
+}
+
+function refuseBuild(resource) {
+  const { location } = resource;
+  if (TRANSPORTS[location.type].build(location)) return;
+  if (location.type !== "local") fail(`${resource.name}: transport ${location.type} does not support build mode`);
+  fail(`${resource.name}: agent ${location.agent} has no build mode — name its mode in location.modes.build`);
 }
 
 // ---------------------------------------------------------------- argument parsing
@@ -1345,7 +1479,7 @@ async function main(args) {
   const resource = findResource(config, command);
   const parsed = parseArgs(rest);
   const transport = TRANSPORTS[resource.location.type];
-  if (parsed.mode === "build" && !transport.build) fail(`${resource.name}: transport ${resource.location.type} does not support build mode`);
+  if (parsed.mode === "build") refuseBuild(resource);
   let question;
   if (parsed.action !== "ask") {
     if (parsed.words.length || parsed.stdin) fail(`--${parsed.action} does not take question text`);
