@@ -182,7 +182,7 @@ function readJsonc(file) {
 }
 
 // The personal file is merged on top of the shared one: objects are merged, arrays and values are replaced,
-// null removes a key.
+// null removes a key. A location with another type replaces the shared one whole, see mergeConfig.
 function merge(base, over) {
   if (over === undefined) return base;
   if (!isObject(base) || !isObject(over)) return over;
@@ -194,10 +194,26 @@ function merge(base, over) {
   return result;
 }
 
+// A personal location with another transport replaces the shared one instead of being merged into it:
+// the fields of one transport mean nothing to the other (the ssh host and port for a local agent), and
+// a merge would leave them in the location as config errors.
+function mergeConfig(shared, personal) {
+  const config = merge(shared, personal);
+  if (!isObject(personal.resources) || !isObject(config.resources)) return config;
+  for (const [name, resource] of Object.entries(personal.resources)) {
+    const own = isObject(resource) ? resource.location : undefined;
+    const base = shared.resources?.[name]?.location;
+    if (isObject(own) && isObject(base) && own.type !== undefined && own.type !== base.type) {
+      config.resources[name] = { ...config.resources[name], location: merge({}, own) };
+    }
+  }
+  return config;
+}
+
 function loadConfig() {
   const shared = readJsonc(CONFIG_FILE);
   if (shared === undefined) fail(`no .opencode/resources.jsonc in ${process.cwd()} or any folder above — run from a project with a resources config or create a template: resource-agent init`);
-  const config = merge(shared, readJsonc(LOCAL_FILE) ?? {});
+  const config = mergeConfig(shared, readJsonc(LOCAL_FILE) ?? {});
   const errors = validate(config);
   if (errors.length) fail(`config errors:\n  - ${errors.join("\n  - ")}`);
   const options = { ...DEFAULT_OPTIONS, ...config.options };
@@ -1118,7 +1134,8 @@ const LOCAL_TEMPLATE = `// Template for personal resource settings. resource-age
 // if that file does not exist yet. That file is not committed to git.
 //
 // The personal file is merged on top of resources.jsonc: objects are merged, values are replaced,
-// null removes a key. Usually it sets the agent model and your own paths to the repositories.
+// null removes a key. A location with another type (local instead of ssh) replaces the shared one whole.
+// Usually it sets the agent model and your own paths to the repositories.
 {
   "resources": {
     // "backend": {

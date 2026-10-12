@@ -710,3 +710,30 @@ test("ssh: config errors", (t) => {
   t.after(() => project.cleanup());
   assert.match(project.run(["backend", "q"]).stderr, /docs\.location\.model: not used by ssh.*null in resources\.local\.jsonc/);
 });
+
+test("config: a personal location with another type replaces the shared one whole", (t) => {
+  const project = makeProject({
+    shared: SSH_SHARED,
+    local: `{ "resources": {
+      "backend": { "location": { "type": "local", "path": "../back", "model": "x/y" } },
+      "frontend": { "location": { "type": "ssh", "host": "agents.test" } },
+      "docs": { "location": { "user": "alice" } }
+    } }`,
+  });
+  t.after(() => project.cleanup());
+
+  const listed = project.run(["resources", "--json"]);
+  assert.equal(listed.code, 0, listed.stderr);
+  const types = Object.fromEntries(JSON.parse(listed.stdout).map((r) => [r.name, r.type]));
+  assert.deepEqual(types, { backend: "local", docs: "ssh", frontend: "ssh" });
+  // other fields of the resource are still merged
+  assert.match(project.run(["resources"]).stdout, /^backend \(back\)/m);
+
+  const backend = project.run(["profile", "backend"]);
+  assert.equal(backend.code, 0, backend.stderr);
+  assert.match(backend.stdout, new RegExp(`Folder: ${project.back}\\n`));
+  // the same type is merged as before: the shared host stays, the user is replaced
+  const docs = project.run(["profile", "docs"], { env: { RESOURCE_AGENT_CHAT: "chat1" } });
+  assert.equal(docs.code, 0, docs.stderr);
+  assert.match(docs.stdout, /Server: alice@docs\.test\n/);
+});

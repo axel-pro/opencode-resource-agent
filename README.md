@@ -81,8 +81,10 @@ To update, change the tag and run `npm install` again, then restart OpenCode. Ve
 ```
 
 `.opencode/resources.local.jsonc` is the personal file, not committed to git. It is merged on top of the shared
-one: objects are merged, values are replaced, `null` removes a key. It usually sets the model (everyone has their
-own providers) and personal paths to the repositories. `resource-agent init` creates it from the template
+one: objects are merged, values are replaced, `null` removes a key. A `location` with another `type` replaces the
+shared one whole: to run an `ssh` resource locally, give the full local `location`, and the shared `host` and `port`
+do not get into it. The personal file usually sets the model (everyone has their own providers) and personal paths
+to the repositories. `resource-agent init` creates it from the template
 `.opencode/resources.local.example.jsonc`.
 
 If no model is set, the resource's OpenCode silently uses its default model, which may be an external service.
